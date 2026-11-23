@@ -1,0 +1,32 @@
+# Local Python virtual environments & bytecode
+windows/.venv/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Camera session logs (keep personal camera reports out of git)
+logs/
+*.log
+
+# Build intermediates
+*.o
+.zig-cache/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# Never commit Sony firmware dumps or media clips
+*.tar
+*.bin
+*.MP4
+*.mp4
+*.ARW
+appFw.so
+libmpr.so
+libsencore.so
+libJiritsu.so

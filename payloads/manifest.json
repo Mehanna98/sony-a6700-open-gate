@@ -1,0 +1,60 @@
+{
+  "compiler": "zig.exe",
+  "target": "aarch64-linux-gnu",
+  "modules": [
+    {
+      "name": "a6700_probe_ro",
+      "file": "a6700_probe_ro.so",
+      "size": 31920,
+      "sha256": "e1ec9c524752cd7d230c4fdfcffa235a426df09079802cf2c48fe761be26f3d1"
+    },
+    {
+      "name": "a6700_cine_ei_ram",
+      "file": "a6700_cine_ei_ram.so",
+      "size": 31208,
+      "sha256": "d80e92d24a88e31abff838f5ff72df98c41182274602f3b80d912a2b3cc34ee9"
+    },
+    {
+      "name": "a6700_features_ram",
+      "file": "a6700_features_ram.so",
+      "size": 14360,
+      "sha256": "8384c2bf30dfc5cefab17dab2b5b3aa65c020a87329dd95a8ede5325da98421a"
+    },
+    {
+      "name": "a6700_shutter_ram",
+      "file": "a6700_shutter_ram.so",
+      "size": 14456,
+      "sha256": "38f4798a35838a5c8a9e3f60616f2c7cb86445a91ffaa603182557ddb0414c33"
+    },
+    {
+      "name": "a6700_exposure_ram",
+      "file": "a6700_exposure_ram.so",
+      "size": 14456,
+      "sha256": "7fb728dec23c884e38aa9d3bff93ce8d11a50f75008de7e9c1bd194aadee81c8"
+    },
+    {
+      "name": "a6700_ftp_ram",
+      "file": "a6700_ftp_ram.so",
+      "size": 14432,
+      "sha256": "4705cca560c89cc775c798d7cc3a41ebe2557ac0331da88dc382f68b8a9d8768"
+    },
+    {
+      "name": "a6700_fl23_ram",
+      "file": "a6700_fl23_ram.so",
+      "size": 23320,
+      "sha256": "9e0d3a90a1f00b1912b667d71bf64739f3ab29b837e971dff865362c2a8fb684"
+    },
+    {
+      "name": "a6700_og_probe_ro",
+      "file": "a6700_og_probe_ro.so",
+      "size": 29056,
+      "sha256": "a83edaa8d81a28d9cfbca09f9842efbb1172808efe20cf493ff04b96e141d2eb"
+    },
+    {
+      "name": "a6700_og_ram",
+      "file": "a6700_og_ram.so",
+      "size": 41160,
+      "sha256": "03f952b1b1f33abd91936fb66da201c9ebb69a53b33345cd290b0132a7a4ad96"
+    }
+  ]
+}
