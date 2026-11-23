@@ -54,7 +54,8 @@ Unlocks true **3:2 Open Gate (`3840 × 2560`, 10-bit 4:2:2)** with **full synced
 
 - **"Unable to display" during in-camera playback is completely normal:** Sony's built-in camera player only decodes 16:9 clips. Your `.MP4` files on the SD card (`PRIVATE\M4ROOT\CLIP\`) play cleanly in **Gyroflow, VLC, DaVinci Resolve, Premiere Pro**, etc.
 - **Stay on XAVC S 4K 25p (or 24p) while Open Gate is active:** Avoid switching to **4K 50p / 60p** while Open Gate is loaded — 50p/60p shares part of the same sensor table and isn't wired up yet (switching to it will simply trigger a safe restart back to stock).
-- **Powering off or swapping batteries resets to stock:** To shoot longer without re-applying, set **Power Save Start Time → Off** and power the camera via a **USB-C PD power bank** or dummy battery.
+- **Returning to normal 16:9 stock requires a battery pull (~10 seconds):** Flipping the power switch OFF/ON only resets the sensor chip (Open Gate's sensor half + FL2/FL3) while Linux sleeps in RAM (keeping Cine EI and the `2560` encoder half loaded). If you want to go back to normal 16:9 shooting cleanly, **pull the battery for ~10 seconds** so both chips reset together. *(Conversely, if you flipped the power switch OFF/ON and want Open Gate back, just boot on Photo/Stills and re-run `open_gate_4k.cmd` — Cine EI stays active!)*
+- **Keeping Open Gate active between shots:** Leave the power switch ON, set **Power Save Start Time → Off**, and use a **USB-C PD power bank** or dummy battery for long sessions.
 - **NLE compatibility tip:** If an editor displays 3:2 clips vertically squeezed, remuxing with `ffmpeg -i input.mp4 -map 0:v:0 -map 0:a? -c copy -movflags +faststart fixed.mp4` fixes the container flags *(note: stripping the `rtmd` track removes Gyroflow data, so run Gyroflow first on the original `.MP4`!)*.
 - **Firmware v2.00 only:** Do not attempt to bypass the firmware check on other firmware versions.
 
