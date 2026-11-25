@@ -373,6 +373,10 @@ static void scan_cp_for_dmmcfg(void) {
     u32 pages_scanned = 0;
     u32 hit_va = 0;
 
+    static const u8 DMM_SIG_8A_OG[40] = {
+        0x7f,0x05,0x00,0x00, 0x00,0xfc,0x6c,0x01, 0x0f,0x01,0x00,0x00, 0x00,0x00,0x00,0x00, 0x07,0x00,0x00,0x00,
+        0x7f,0x05,0x00,0x00, 0x00,0xfc,0x6c,0x01, 0x0f,0x01,0x00,0x00, 0x00,0x00,0x00,0x00, 0x07,0x00,0x00,0x00
+    };
     out_s("== cp dmmcfg 0x57f locator (read-only)\n");
     for (u32 r = 0; r < 3u && !hit_va && g_cp_ok; r++) {
         int have_prev = 0;
@@ -386,9 +390,9 @@ static void scan_cp_for_dmmcfg(void) {
             for (u32 o = start_off; o <= end_off; o += 4U) {
                 if (g_scan_win[o] == 0x7fU && g_scan_win[o + 1U] == 0x05U &&
                     g_scan_win[o + 2U] == 0x00U && g_scan_win[o + 3U] == 0x00U &&
-                    g_scan_win[o + 4U] == 0x00U && g_scan_win[o + 5U] == 0x12U &&
-                    g_scan_win[o + 6U] == 0x34U && g_scan_win[o + 7U] == 0x01U) {
-                    if (mem_eq(g_scan_win + o, DMM_SIG_8A, 40U)) {
+                    g_scan_win[o + 7U] == 0x01U) {
+                    if (mem_eq(g_scan_win + o, DMM_SIG_8A, 40U) ||
+                        mem_eq(g_scan_win + o, DMM_SIG_8A_OG, 40U)) {
                         hit_va = (page - 64U) + o;
                         break;
                     }
@@ -430,7 +434,7 @@ static void scan_cp_for_dmmcfg(void) {
               rd_u32(b8b) == 0x124U && rd_u32(b8b + 4U) == 0x03B00000U &&
               rd_u32(b8c) == 0x0ECU && rd_u32(b8c + 4U) == 0x01D80000U &&
               rd_u32(b8d) == 0x0EBU && rd_u32(b8d + 4U) == 0x00EC0000U &&
-              rd_u32(b8e) == 0x57fU && (sz_8e == 0x01341200U || sz_8e == 0x017A3400U || sz_8e == 0x017BAC00U) &&
+              rd_u32(b8e) == 0x57fU && (sz_8e == 0x01341200U || sz_8e == 0x016CFC00U || sz_8e == 0x017A3400U || sz_8e == 0x017BAC00U) &&
               rd_u32(b8e + 20U) == 0x634U && rd_u32(b8e + 24U) == 0x0032A000U &&
               rd_u32(b8e + 60U) == 0x635U && rd_u32(b8e + 64U) == 0x00CA8000U &&
               rd_u32(b8e + 100U) == 0x2DAU && rd_u32(b8e + 104U) == 0x013C6800U &&

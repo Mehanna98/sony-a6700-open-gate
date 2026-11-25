@@ -187,6 +187,35 @@ def cmd_dry_run() -> None:
     print(f"=== ALL {len(pinned)} PAYLOADS VERIFIED (0 USB CALLS MADE) ===")
 
 
+def _print_recovery_hints(text: str) -> None:
+    """Print plain-English recovery guidance for known safe-abort or completion states."""
+    if "dmm_57f_already_divided" in text or "sizetbl_guards_uninitialized" in text:
+        print(
+            "[HINT] Camera video buffer memory was already partitioned (usually from switching\n"
+            "       to Movie mode before plugging in, or from an earlier run).\n"
+            "       Recovery: Turn camera OFF -> pull battery for 10 seconds -> reinsert ->\n"
+            "       leave mode dial on Photo/Stills (not Movie) -> turn ON -> plug USB MSC -> retry."
+        )
+    elif "RESULT=ALREADY_APPLIED" in text or "RESULT=NOTHING_TO_DO" in text:
+        print("[OK] Already active in camera RAM (0 bytes modified).")
+    elif "RESULT=RESTORE_STOCK_OK" in text:
+        print(
+            "[NEXT] Unplug USB, power the camera OFF normally once (saves clean stock Creative Look\n"
+            "       tables to cache), then pull the battery for 10s -> 100% factory stock!"
+        )
+
+
+def _cleanup_channel_files(ch) -> None:
+    for fn in (TRIGGER_NAME, STAGE_NAME, RESULT_NAME):
+        try:
+            if ch.read(fn, missing=True) is not None:
+                ch.remove(fn)
+                gone = ch.read(fn, missing=True) is None
+                print(f"[CLEAN] /tmp/jiritsu/{fn} removed={gone}")
+        except Exception as exc:
+            print(f"[WARN] Cleanup failed for {fn}: {exc}", file=sys.stderr)
+
+
 def _run_live_session(so_name: str, label: str) -> str:
     pinned = load_manifest_hashes()
     so_path = PAYLOAD_DIR / so_name
@@ -222,15 +251,9 @@ def _run_live_session(so_name: str, label: str) -> str:
             print("----- CAMERA REPORT BEGIN -----")
             print(text.rstrip())
             print("------ CAMERA REPORT END ------")
+            _print_recovery_hints(text)
         finally:
-            for fn in (TRIGGER_NAME, STAGE_NAME, RESULT_NAME):
-                try:
-                    if ch.read(fn, missing=True) is not None:
-                        ch.remove(fn)
-                        gone = ch.read(fn, missing=True) is None
-                        print(f"[CLEAN] /tmp/jiritsu/{fn} removed={gone}")
-                except Exception as exc:
-                    print(f"[WARN] Cleanup failed for {fn}: {exc}", file=sys.stderr)
+            _cleanup_channel_files(ch)
     return text
 
 
@@ -247,48 +270,106 @@ def cmd_clean() -> None:
                 print(f"[OK] /tmp/jiritsu/{fn} already clean")
 
 
-def cmd_combo() -> None:
-    """Guided All-in-One: Open Gate 4K 3:2 -> Cine EI -> FX2 FL2/FL3."""
+def cmd_combo(use_fuji: bool = False) -> None:
+    """True 1-Plug All-in-One: stacks Open Gate v6.1 + Cine EI v2.2 + FX2 FL2/FL3 (or Fuji 4-Sim) in ONE USB session."""
+    look_step = (
+        ("Fujifilm 4-Sim Pack (FL/VV2/IN/SH)", "a6700_fuji_ram.so", "combo_3_fuji")
+        if use_fuji
+        else ("FX2 FL2 (IN) & FL3 (SH)", "a6700_fl23_ram.so", "combo_3_fl23")
+    )
     steps = [
-        ("Open Gate 4K 3:2 (3840x2560)", "a6700_og_ram.so", "og_apply_ram"),
-        ("Cine EI (Base ISO 800/2500)",  "a6700_cine_ei_ram.so", "cine_ei_ram"),
-        ("FX2 FL2 (IN) & FL3 (SH)",      "a6700_fl23_ram.so", "fl23_ram"),
+        ("Open Gate v6.1 (4K 24p/25p 3:2)", "a6700_og_ram.so", "combo_1_og_ram"),
+        ("Cine EI v2.2 (Base ISO 800/2500)", "a6700_cine_ei_ram.so", "combo_2_cine_ei"),
+        look_step,
     ]
-    print("============================================================")
-    print("  Sony a6700 (FW v2.00) ALL-IN-ONE RAM-ONLY COMBO")
-    print("  Order: Open Gate 4K 3:2 -> Cine EI -> FL2 / FL3")
-    print("  Keep camera powered ON (Photo/Stills dial) throughout!")
-    print("============================================================\n")
-    for idx, (title, so_name, label) in enumerate(steps, 1):
-        print(f"\n--- Step {idx}/{len(steps)}: {title} ---")
-        if idx > 1:
-            print(">>> Do NOT power the camera off!")
-            print(">>> Unplug & replug USB, select Mass Storage (MSC), then press Enter...")
-            input()
-        text = _run_live_session(so_name, label)
-        if "RESULT=APPLY_OK" not in text and "RESULT=NOTHING_TO_DO" not in text:
-            raise SystemExit(f"\n[STOPPED] Step {idx} ({title}) did not report APPLY_OK. Camera unchanged/rolled back.")
+    pinned = load_manifest_hashes()
+    prepared: list[tuple[str, str, bytes]] = []
+    for title, so_name, label in steps:
+        so_path = PAYLOAD_DIR / so_name
+        info = verify_elf_payload(so_path, expected_sha=pinned.get(so_name))
+        print(f"[PREFLIGHT] {title:34s} -> {so_name} ({info['size']:,} B, sha256={info['sha256'][:12]}...)")
+        prepared.append((title, label, so_path.read_bytes()))
+
     print("\n============================================================")
-    print("  ALL 3 FEATURES ARE NOW LIVE IN RAM!")
-    print("  Unplug USB and switch to Movie (XAVC S 4K 25p or 24p).")
+    print("  Sony a6700 (FW v2.00) -- 1-PLUG ALL-IN-ONE COMBO (v6.1)")
+    print("  Running all 3 modules inside ONE single USB session (~17s).")
+    print("  Do NOT unplug USB until ALL 3 complete!")
+    print("============================================================\n")
+
+    jiritsu = _import_transport()
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    allowed = (STAGE_NAME, TRIGGER_NAME, RESULT_NAME)
+
+    with jiritsu.Channel(allowed=allowed) as ch:
+        _install_clean_senser_reader(ch)
+        stale = [fn for fn in allowed if ch.read(fn, missing=True) is not None]
+        if stale:
+            raise RuntimeError(
+                f"Leftover files found in /tmp/jiritsu/: {stale}. Run with --clean first."
+            )
+        try:
+            total = len(prepared)
+            for idx, (title, label, blob) in enumerate(prepared, start=1):
+                print(f"\n=== [COMBO {idx}/{total}] {title} ===")
+                raw_res, _ = ch.run_module(
+                    blob=blob,
+                    stage_name=STAGE_NAME,
+                    out_name=RESULT_NAME,
+                    trigger_name=TRIGGER_NAME,
+                    force=False,
+                )
+                text = raw_res.decode("utf-8", "replace") if raw_res else "(empty result)"
+                log_path = LOGS_DIR / f"{ts}_{label}.txt"
+                log_path.write_text(text, encoding="utf-8")
+                print(f"[OK] Saved report to {log_path}")
+                print("----- CAMERA REPORT BEGIN -----")
+                print(text.rstrip())
+                print("------ CAMERA REPORT END ------")
+                _print_recovery_hints(text)
+                _cleanup_channel_files(ch)
+
+                ok = (
+                    "RESULT=APPLY_OK" in text
+                    or "RESULT=ALREADY_APPLIED" in text
+                    or "RESULT=NOTHING_TO_DO" in text
+                )
+                if not ok:
+                    raise SystemExit(
+                        f"\n[STOPPED] Step {idx}/{total} ({title}) did not return APPLY_OK / ALREADY_APPLIED. "
+                        f"See {log_path}"
+                    )
+        finally:
+            _cleanup_channel_files(ch)
+
+    print("\n============================================================")
+    print("  ALL 3 FEATURES ARE NOW LIVE IN RAM (1 USB SESSION)!")
+    print("  Unplug USB and switch to Movie (XAVC HS / S / S-I 4K 25p or 24p).")
+    if use_fuji:
+        print("  Creative Looks: FL=Classic Chrome, VV2=Classic Neg, IN=Nostalgic Neg, SH=Eterna.")
+    else:
+        print("  Creative Looks: IN=FX2 FL2, SH=FX2 FL3.")
     print("============================================================")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Safe zero-flash RAM-only runner for Sony ILCE-6700 (FW v2.00)")
     g = ap.add_mutually_exclusive_group(required=True)
-    g.add_argument("--dry-run",   action="store_true", help="Verify all payloads & Python USB stack offline (no USB)")
-    g.add_argument("--probe",     action="store_true", help="Read-only AP-RAM safety check (Cine EI / Pro Pack)")
-    g.add_argument("--og-probe",  action="store_true", help="Read-only CP-RAM safety check (Open Gate / FL2-FL3)")
-    g.add_argument("--open-gate", action="store_true", help="Apply RAM-only Open Gate 4K 3:2 (3840x2560, PAL 25p / NTSC 24p)")
-    g.add_argument("--cine-ei",   action="store_true", help="Apply RAM-only Cine EI (Base ISO 800/2500)")
-    g.add_argument("--fl23",      action="store_true", help="Apply RAM-only FX2 FL2 (IN) & FL3 (SH) Creative Looks")
-    g.add_argument("--combo",     action="store_true", help="Guided All-in-One: Open Gate + Cine EI + FL2/FL3")
-    g.add_argument("--pro-pack",  action="store_true", help="Apply RAM-only Pro Pack (Shutter Curtain + Flex Exp + FTP)")
-    g.add_argument("--shutter",   action="store_true", help="Apply RAM-only Power-Off Shutter Curtain")
-    g.add_argument("--exposure",  action="store_true", help="Apply RAM-only Flexible Exposure")
-    g.add_argument("--ftp",       action="store_true", help="Apply RAM-only Native FTP Transfer")
-    g.add_argument("--clean",     action="store_true", help="Remove any leftover temp files in /tmp/jiritsu/")
+    g.add_argument("--dry-run",       action="store_true", help="Verify all payloads & Python USB stack offline (no USB)")
+    g.add_argument("--probe",         action="store_true", help="Read-only AP-RAM safety check (Cine EI / Pro Pack)")
+    g.add_argument("--og-probe",      action="store_true", help="Read-only CP-RAM safety check (Open Gate / Creative Looks)")
+    g.add_argument("--open-gate",     action="store_true", help="Apply RAM-only Open Gate v6.1 (4K 24p/25p 3:2 HS/S/S-I; 50p stays stock)")
+    g.add_argument("--cine-ei",       action="store_true", help="Apply RAM-only Cine EI v2.2 (Base ISO 800/2500, strict idempotent)")
+    g.add_argument("--fl23",          action="store_true", help="Apply RAM-only FX2 FL2 (IN) & FL3 (SH) Creative Looks")
+    g.add_argument("--fuji",          action="store_true", help="Apply RAM-only 4 Hardware Fujifilm Film Sims (FL/VV2/IN/SH)")
+    g.add_argument("--combo",         action="store_true", help="1-Plug Combo: Open Gate v6.1 + Cine EI v2.2 + FX2 FL2/FL3")
+    g.add_argument("--combo-fuji",    action="store_true", help="1-Plug Combo: Open Gate v6.1 + Cine EI v2.2 + 4 Fujifilm Film Sims")
+    g.add_argument("--restore-looks", action="store_true", help="Restore Creative Look CP tables & cache to 100%% factory stock")
+    g.add_argument("--pro-pack",      action="store_true", help="Apply RAM-only Pro Pack (Shutter Curtain + Flex Exp + FTP)")
+    g.add_argument("--shutter",       action="store_true", help="Apply RAM-only Power-Off Shutter Curtain")
+    g.add_argument("--exposure",      action="store_true", help="Apply RAM-only Flexible Exposure")
+    g.add_argument("--ftp",           action="store_true", help="Apply RAM-only Native FTP Transfer")
+    g.add_argument("--clean",         action="store_true", help="Remove any leftover temp files in /tmp/jiritsu/")
     args = ap.parse_args()
 
     if args.dry_run:
@@ -296,7 +377,9 @@ def main() -> None:
     elif args.clean:
         cmd_clean()
     elif args.combo:
-        cmd_combo()
+        cmd_combo(use_fuji=False)
+    elif args.combo_fuji:
+        cmd_combo(use_fuji=True)
     elif args.probe:
         _run_live_session("a6700_probe_ro.so", "probe_ro")
     elif args.og_probe:
@@ -307,6 +390,10 @@ def main() -> None:
         _run_live_session("a6700_cine_ei_ram.so", "cine_ei_ram")
     elif args.fl23:
         _run_live_session("a6700_fl23_ram.so", "fl23_ram")
+    elif args.fuji:
+        _run_live_session("a6700_fuji_ram.so", "fuji_ram")
+    elif args.restore_looks:
+        _run_live_session("a6700_cc_restore_stock.so", "restore_looks")
     elif args.pro_pack:
         _run_live_session("a6700_features_ram.so", "pro_pack_ram")
     elif args.shutter:

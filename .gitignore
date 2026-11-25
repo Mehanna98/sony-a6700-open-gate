@@ -1,6 +1,8 @@
 # Local Python virtual environments & bytecode
 windows/.venv/
+mac/.venv_mac/
 .venv/
+.venv_mac/
 __pycache__/
 *.py[cod]
 *$py.class

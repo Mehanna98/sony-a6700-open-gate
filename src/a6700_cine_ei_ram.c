@@ -85,7 +85,7 @@ static int cow_write_u32(u64 addr, u32 val) {
 
 __attribute__((visibility("default"))) void _init(void) {
     g_olen = 0;
-    out_s("A6700_CINE_EI_RAM_V2_1\n");
+    out_s("A6700_CINE_EI_RAM_V2_2\n");
 
     /* ==== PASS 0: File SHA-256 & /proc/self/maps identity gate ============ */
     u64 fsz = 0;
@@ -103,63 +103,88 @@ __attribute__((visibility("default"))) void _init(void) {
         return;
     }
 
-    /* ==== PASS 1: 100% Dry Preimage Check (ZERO writes!) ================== */
-    u32 errs = 0;
+    /* ==== PASS 1: 100% Dry Preimage & Idempotency Check (ZERO writes!) ==== */
+    u32 fatal_errs = 0;
+    u32 stock_errs = 0;
+    u32 applied_errs = 0;
+    u32 s2_ctr0_errs = 0;
 
-    /* 1a. All 25 fixed byte/code patches */
+    /* 1a. All 81 fixed byte/code patches (check BOTH stock and already-applied) */
     for (u32 i = 0; i < CINE_BYTE_PATCH_COUNT; i++) {
         const struct byte_patch *bp = &CINE_BYTE_PATCHES[i];
         u8 cur[24];
         if (!safe_read_bytes(g_load_base + bp->elf_va, cur, bp->len)) {
             out_s("PRE_FAIL unmapped "); out_s(bp->tag); out_s("\n");
-            errs++;
+            fatal_errs++;
             continue;
         }
+        int eq_stock = 1;
+        int eq_after = 1;
         for (u8 k = 0; k < bp->len; k++) {
-            if (cur[k] != bp->before[k]) {
-                out_s("PRE_FAIL byte "); out_s(bp->tag); out_s(" va="); out_hex(bp->elf_va);
-                out_s(" got="); out_hex_bytes(cur, bp->len); out_s("\n");
-                errs++;
-                break;
-            }
+            if (cur[k] != bp->before[k]) eq_stock = 0;
+            if (cur[k] != bp->after[k])  eq_after = 0;
+        }
+        if (!eq_stock) stock_errs++;
+        if (!eq_after) applied_errs++;
+        if (!eq_stock && !eq_after) {
+            out_s("PRE_FAIL byte "); out_s(bp->tag); out_s(" va="); out_hex(bp->elf_va);
+            out_s(" got="); out_hex_bytes(cur, bp->len); out_s("\n");
         }
     }
 
-    /* 1b. Layer 3 (PRM 0x2bd): verify LAX ptr & stock DZ == 0 */
+    /* 1b. Layer 3 (PRM 0x2bd): verify LAX ptr & stock DZ == 0 (never written at runtime) */
     u64 l3_lax = 0, l3_dz = 0;
     u64 exp_lax = g_load_base + LAYER3_LAX_TARGET_VA;
     if (!safe_read_u64(g_load_base + LAYER3_LAX_SLOT_VA, &l3_lax) || l3_lax != exp_lax) {
         out_s("PRE_FAIL l3_lax got="); out_hex(l3_lax); out_s(" exp="); out_hex(exp_lax); out_s("\n");
-        errs++;
+        fatal_errs++;
     }
     if (!safe_read_u64(g_load_base + LAYER3_DZ_SLOT_VA, &l3_dz) || l3_dz != 0ULL) {
         out_s("PRE_FAIL l3_dz got="); out_hex(l3_dz); out_s("\n");
-        errs++;
+        fatal_errs++;
     }
 
-    /* 1c. Step 3 (.bss HIGH Base ISO anchor == 26 on both copies) */
+    /* 1c. Step 3 (.bss HIGH Base ISO anchor == 26 stock or 19 applied on both copies) */
     u32 s3a = 0, s3b = 0;
-    if (!safe_read_u32(g_load_base + STEP3_HIGH_A_VA, &s3a) || s3a != STEP3_STOCK_VAL) {
-        out_s("PRE_FAIL step3_a got="); out_u64(s3a); out_s("\n");
-        errs++;
+    if (!safe_read_u32(g_load_base + STEP3_HIGH_A_VA, &s3a)) {
+        out_s("PRE_FAIL step3_a unmapped\n");
+        fatal_errs++;
+    } else {
+        if (s3a != STEP3_STOCK_VAL)  stock_errs++;
+        if (s3a != STEP3_TARGET_VAL) applied_errs++;
+        if (s3a != STEP3_STOCK_VAL && s3a != STEP3_TARGET_VAL) {
+            out_s("PRE_FAIL step3_a got="); out_u64(s3a); out_s("\n");
+        }
     }
-    if (!safe_read_u32(g_load_base + STEP3_HIGH_B_VA, &s3b) || s3b != STEP3_STOCK_VAL) {
-        out_s("PRE_FAIL step3_b got="); out_u64(s3b); out_s("\n");
-        errs++;
+    if (!safe_read_u32(g_load_base + STEP3_HIGH_B_VA, &s3b)) {
+        out_s("PRE_FAIL step3_b unmapped\n");
+        fatal_errs++;
+    } else {
+        if (s3b != STEP3_STOCK_VAL)  stock_errs++;
+        if (s3b != STEP3_TARGET_VAL) applied_errs++;
+        if (s3b != STEP3_STOCK_VAL && s3b != STEP3_TARGET_VAL) {
+            out_s("PRE_FAIL step3_b got="); out_u64(s3b); out_s("\n");
+        }
     }
 
-    /* 1d. Live support maps: 5 PIDs in 0x138bd888 + 2 vals in 0x138bd930 */
+    /* 1d. Live support maps: 5 PIDs in 0x138bd888 + 2 vals in 0x138bd930 (0=stock, 1=applied) */
     u64 l1_flag_addrs[5];
     for (u32 i = 0; i < 5u; i++) {
         u64 node = umap_find_node(g_load_base + MAP_PID_SUPPORT_VA, STEP2_L1_PIDS[i]);
         u8 v = 0xff;
-        if (!node || !safe_read_bytes(node + 0x0cULL, &v, 1) || v != 0) {
+        if (!node || !safe_read_bytes(node + 0x0cULL, &v, 1)) {
             out_s("PRE_FAIL l1_map pid="); out_hex(STEP2_L1_PIDS[i]);
-            out_s(" node="); out_hex(node); out_s(" v="); out_u64(v); out_s("\n");
-            errs++;
+            out_s(" node="); out_hex(node); out_s("\n");
+            fatal_errs++;
             l1_flag_addrs[i] = 0;
         } else {
             l1_flag_addrs[i] = node + 0x0cULL;
+            if (v != 0U) stock_errs++;
+            if (v != 1U) applied_errs++;
+            if (v != 0U && v != 1U) {
+                out_s("PRE_FAIL l1_map pid="); out_hex(STEP2_L1_PIDS[i]);
+                out_s(" v="); out_u64(v); out_s("\n");
+            }
         }
     }
 
@@ -167,23 +192,30 @@ __attribute__((visibility("default"))) void _init(void) {
     u64 l2_outer = umap_find_node(g_load_base + MAP_VAL_SUPPORT_VA, STEP2_L2_PID);
     if (!l2_outer) {
         out_s("PRE_FAIL l2_map outer 0x467 not found\n");
-        errs++;
+        fatal_errs++;
     } else {
         for (u32 i = 0; i < 2u; i++) {
             u64 node = umap_find_node(l2_outer + 0x10ULL, STEP2_L2_VALS[i]);
             u8 v = 0xff;
-            if (!node || !safe_read_bytes(node + 0x0cULL, &v, 1) || v != 0) {
+            if (!node || !safe_read_bytes(node + 0x0cULL, &v, 1)) {
                 out_s("PRE_FAIL l2_map val="); out_u64(STEP2_L2_VALS[i]);
-                out_s(" node="); out_hex(node); out_s(" v="); out_u64(v); out_s("\n");
-                errs++;
+                out_s(" node="); out_hex(node); out_s("\n");
+                fatal_errs++;
             } else {
                 l2_flag_addrs[i] = node + 0x0cULL;
+                if (v != 0U) stock_errs++;
+                if (v != 1U) applied_errs++;
+                if (v != 0U && v != 1U) {
+                    out_s("PRE_FAIL l2_map val="); out_u64(STEP2_L2_VALS[i]);
+                    out_s(" v="); out_u64(v); out_s("\n");
+                }
             }
         }
     }
 
     /* 1e. All 114 Step-2 flag_slot pointers must match; capture live counters for 58 active FX30 pairs
-     *     (each active pair must have ctr >= 1 so decrement-by-1 cannot underflow exclusion_manager.cpp:1599!) */
+     *     (when applying from stock, each active pair must have ctr >= 1 so decrement-by-1 cannot underflow;
+     *      when ALREADY_APPLIED, counters are NOT touched at all, so ctr == 0 is expected and safe!) */
     u32 s2_before[STEP2_PAIR_COUNT];
     for (u32 i = 0; i < STEP2_PAIR_COUNT; i++) {
         const struct step2_pair *p = &STEP2_PAIRS[i];
@@ -195,17 +227,30 @@ __attribute__((visibility("default"))) void _init(void) {
             !safe_read_u32(g_load_base + p->counter_va, &ctr) ||
             !is_readable(g_load_base + p->flag_va, 1)) {
             out_s("PRE_FAIL step2 node="); out_u64(p->node); out_s("\n");
-            errs++;
+            fatal_errs++;
             continue;
         }
         s2_before[i] = ctr;
         if (p->active && ctr == 0U) {
-            out_s("PRE_FAIL step2_ctr0 node="); out_u64(p->node); out_s("\n");
-            errs++;
+            s2_ctr0_errs++;
         }
     }
 
-    if (errs != 0) {
+    /* Strict idempotency gate: if EVERY byte patch, Step-3 anchor, and live support flag
+     * is already in its applied state, exit with 0 writes and 0 Step-2 counter decrements! */
+    if (fatal_errs == 0U && applied_errs == 0U) {
+        out_s("PASS1_PREIMAGE=ALREADY_APPLIED\n");
+        out_s("RESULT=ALREADY_APPLIED writes=0\n");
+        flush_result();
+        return;
+    }
+
+    u32 errs = fatal_errs + stock_errs + s2_ctr0_errs;
+    if (errs != 0U) {
+        out_s("PRE_FAIL summary fatal="); out_u64(fatal_errs);
+        out_s(" stock="); out_u64(stock_errs);
+        out_s(" applied="); out_u64(applied_errs);
+        out_s(" s2_ctr0="); out_u64(s2_ctr0_errs); out_s("\n");
         out_s("RESULT=ABORT_MISMATCH pre_errors="); out_u64(errs); out_s(" writes=0\n");
         flush_result();
         return;

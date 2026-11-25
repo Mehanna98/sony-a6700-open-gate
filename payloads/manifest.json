@@ -11,8 +11,8 @@
     {
       "name": "a6700_cine_ei_ram",
       "file": "a6700_cine_ei_ram.so",
-      "size": 31208,
-      "sha256": "d80e92d24a88e31abff838f5ff72df98c41182274602f3b80d912a2b3cc34ee9"
+      "size": 33848,
+      "sha256": "49c81c89a7175add60a14320d6c0dd8a67d9ca083990b2677e18b2ebedb00eb9"
     },
     {
       "name": "a6700_features_ram",
@@ -45,16 +45,28 @@
       "sha256": "9e0d3a90a1f00b1912b667d71bf64739f3ab29b837e971dff865362c2a8fb684"
     },
     {
+      "name": "a6700_fuji_ram",
+      "file": "a6700_fuji_ram.so",
+      "size": 34016,
+      "sha256": "0031fd96d6666e3c325d3956bfc69c059b8e888cb708e805e0e6da7a08778a61"
+    },
+    {
+      "name": "a6700_cc_restore_stock",
+      "file": "a6700_cc_restore_stock.so",
+      "size": 13232,
+      "sha256": "a15553d233a1723b22adeef6b61cb7607ff7e19fd524cd476062283148c7e7e5"
+    },
+    {
       "name": "a6700_og_probe_ro",
       "file": "a6700_og_probe_ro.so",
-      "size": 29056,
-      "sha256": "a83edaa8d81a28d9cfbca09f9842efbb1172808efe20cf493ff04b96e141d2eb"
+      "size": 29928,
+      "sha256": "6177fa4fcc14177741c6ee46a73ae1ca0afc1d0477ebfca3a32311f7740d6211"
     },
     {
       "name": "a6700_og_ram",
       "file": "a6700_og_ram.so",
-      "size": 41160,
-      "sha256": "03f952b1b1f33abd91936fb66da201c9ebb69a53b33345cd290b0132a7a4ad96"
+      "size": 42184,
+      "sha256": "8014b06ac0ad26aa569925b2afcea65f99d68bb2f9b0047ced316d14779cd671"
     }
   ]
 }

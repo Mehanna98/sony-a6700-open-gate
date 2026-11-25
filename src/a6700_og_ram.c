@@ -299,12 +299,25 @@ static int hash_disk_file(const char *path, u64 *out_sz, u8 dig[32]) {
     return 1;
 }
 
-/* ---- Private Copy-on-Write writer for libmpr.so (.rodata in PT_LOAD[0]) -- */
+static void flush_icache_range(u64 start, u64 len) {
+    u64 end = start + len;
+    for (u64 p = start & ~63ULL; p < end; p += 64ULL) {
+        __asm__ volatile("dc cvau, %0" :: "r"(p) : "memory");
+    }
+    __asm__ volatile("dsb ish" ::: "memory");
+    for (u64 p = start & ~63ULL; p < end; p += 64ULL) {
+        __asm__ volatile("ic ivau, %0" :: "r"(p) : "memory");
+    }
+    __asm__ volatile("dsb ish\nisb" ::: "memory");
+}
+
+/* ---- Private Copy-on-Write writer for libmpr.so (.rodata & .text in PT_LOAD[0]) -- */
 static int cow_write_libmpr(u64 file_off, const u8 *src, u64 len) {
     u8 perms = 0;
     u64 va = find_mapped_slice("/libmpr.so", file_off, len, 1u, &perms, 0, 0);
     if (!va) return 0;
     int need_mprot = !(perms & 2u);
+    int is_code = (perms & 4u) != 0u;
     u64 pg_start = va & ~4095ULL;
     u64 pg_end   = (va + len + 4095ULL) & ~4095ULL;
     u64 pg_len   = pg_end - pg_start;
@@ -312,11 +325,22 @@ static int cow_write_libmpr(u64 file_off, const u8 *src, u64 len) {
                   | ((perms & 2u) ? PROT_WRITE : 0)
                   | ((perms & 4u) ? PROT_EXEC : 0);
     if (need_mprot) {
+        /* Preserve PROT_EXEC on RX pages while other appFw threads execute! */
         if (sys_mprotect(pg_start, pg_len, orig_prot | PROT_WRITE) != 0) return 0;
     }
-    volatile u8 *dst = (volatile u8 *)va;
-    for (u64 i = 0; i < len; i++) dst[i] = src[i];
-    __asm__ volatile("dsb ish" ::: "memory");
+    if (is_code && ((va & 3ULL) == 0ULL) && ((len & 3ULL) == 0ULL)) {
+        volatile u32 *dst32 = (volatile u32 *)va;
+        for (u64 i = 0; i < len; i += 4ULL) {
+            u32 w = (u32)src[i] | ((u32)src[i + 1U] << 8)
+                  | ((u32)src[i + 2U] << 16) | ((u32)src[i + 3U] << 24);
+            __atomic_store_n(&dst32[i >> 2], w, __ATOMIC_RELEASE);
+        }
+        flush_icache_range(va, len);
+    } else {
+        volatile u8 *dst = (volatile u8 *)va;
+        for (u64 i = 0; i < len; i++) dst[i] = src[i];
+        __asm__ volatile("dsb ish" ::: "memory");
+    }
     if (need_mprot) {
         (void)sys_mprotect(pg_start, pg_len, orig_prot);
     }
@@ -488,14 +512,27 @@ static u8 g_touched_drv_8c0;
 static u8 g_touched_drv_880;
 static u8 g_touched_sizetbl;
 static u8 g_touched_lm[OG_LIBMPR_SITE_COUNT];
-static u8 g_touched_av[OG_AVCAM_PATCH_COUNT];
+static u8 g_touched_av_blob[OG_AVCAM_BLOB_COUNT];
+static u8 g_touched_av_h[OG_AVCAM_HPATCH_COUNT];
+
+static const u8 OG_H2160_BYTES[4] = { 0x70, 0x08, 0x00, 0x00 };
+static const u8 OG_H2560_BYTES[4] = { 0x00, 0x0a, 0x00, 0x00 };
 
 static void rollback_all(u8 *av_map) {
     out_s("== ROLLBACK: restoring STOCK to all touched sites\n");
     u32 rb_fail = 0;
-    for (u32 i = 0; i < OG_AVCAM_PATCH_COUNT; i++) {
-        if (!g_touched_av[i] || !av_map) continue;
-        const struct og_av_patch *p = &OG_AVCAM_PATCHES[i];
+    for (u32 i = 0; i < OG_AVCAM_HPATCH_COUNT; i++) {
+        if (!g_touched_av_h[i] || !av_map) continue;
+        const struct og_av_hpatch *hp = &OG_AVCAM_HPATCHES[i];
+        u8 len = hp->is_u32 ? 4U : 2U;
+        u8 *dst = av_map + hp->file_off;
+        for (u8 k = 0; k < len; k++) dst[k] = OG_H2160_BYTES[k];
+        mem_barrier_sy();
+        if (!mem_eq(dst, OG_H2160_BYTES, len)) rb_fail++;
+    }
+    for (u32 i = 0; i < OG_AVCAM_BLOB_COUNT; i++) {
+        if (!g_touched_av_blob[i] || !av_map) continue;
+        const struct og_av_patch *p = &OG_AVCAM_BLOBS[i];
         u8 *dst = av_map + p->file_off;
         for (u8 k = 0; k < p->len; k++) dst[k] = p->stock[k];
         mem_barrier_sy();
@@ -543,7 +580,7 @@ static void rollback_all(u8 *av_map) {
 
 __attribute__((visibility("default"))) void _init(void) {
     g_olen = 0;
-    out_s("A6700_OG_RAM_V6 a6700_og_ram_v6_3968_pal50safe_all7dmm_lcdfill\n");
+    out_s("A6700_OG_RAM_V6_1 " OG_RAM_LABEL "\n");
 
     /* ==== PASS 0: Kernel cmdline, library SHA-256 & CP code-page identity === */
     read_text_file("/proc/cmdline", g_cmdline, sizeof(g_cmdline));
@@ -738,7 +775,7 @@ __attribute__((visibility("default"))) void _init(void) {
         else if (!mem_eq(pR, OG_REC_R_NEW, 3000U)) { out_s("PRE_FAIL rec3000_R\n"); pre_errs++; }
     }
 
-    /* 1c. Stored CSDrvParam[0x08c0] @ 0x025db46c & CSDrvParam[0x0880] @ 0x025db18c (32+32 sparse B) */
+    /* 1c. Stored CSDrvParam[0x08c0 / 0x0880] (29 sparse B each; 0x0820 50p stays stock) */
     {
         u8 *pD = cp_dma_read_span(CP_DRVPARAM_8C0, CP_DRVPARAM_LEN, 0, 0);
         if (!pD) pre_errs++;
@@ -771,7 +808,7 @@ __attribute__((visibility("default"))) void _init(void) {
         }
     }
 
-    /* 1e. Step 3: 4 libmpr.so sites + 101 av-cam.bin sites */
+    /* 1e. Step 3: 11 libmpr.so sites (5 comb + 6 native MP4 hdrs) + 2 av-cam blobs + 304 av-cam height sites */
     for (u32 i = 0; i < OG_LIBMPR_SITE_COUNT; i++) {
         const struct og_mp_site *s = &OG_LIBMPR_SITES[i];
         u64 va = find_mapped_slice("/libmpr.so", s->file_off, s->len, 1u, 0, 0, 0);
@@ -782,22 +819,36 @@ __attribute__((visibility("default"))) void _init(void) {
             pre_errs++;
         }
     }
-    for (u32 i = 0; i < OG_AVCAM_PATCH_COUNT; i++) {
-        const struct og_av_patch *p = &OG_AVCAM_PATCHES[i];
+    for (u32 i = 0; i < OG_AVCAM_BLOB_COUNT; i++) {
+        const struct og_av_patch *p = &OG_AVCAM_BLOBS[i];
         const u8 *cur = av_map + p->file_off;
         if (mem_eq(cur, p->stock, p->len)) to_apply++;
         else if (!mem_eq(cur, p->target, p->len)) {
-            out_s("PRE_FAIL avcam_off="); out_hex(p->file_off); out_s("\n");
+            out_s("PRE_FAIL avcam_blob_off="); out_hex(p->file_off); out_s("\n");
             pre_errs++;
         }
     }
+    for (u32 i = 0; i < OG_AVCAM_HPATCH_COUNT; i++) {
+        const struct og_av_hpatch *hp = &OG_AVCAM_HPATCHES[i];
+        u8 len = hp->is_u32 ? 4U : 2U;
+        const u8 *cur = av_map + hp->file_off;
+        if (mem_eq(cur, OG_H2160_BYTES, len)) to_apply++;
+        else if (!mem_eq(cur, OG_H2560_BYTES, len)) {
+            out_s("PRE_FAIL avcam_h_off="); out_hex(hp->file_off); out_s("\n");
+            pre_errs++;
+        }
+    }
+
+    u32 total_sites = OG_DMM_SITE_COUNT + OG_CP_CELL_COUNT + OG_LCDFILL_CELL_COUNT
+                    + 5U /* recL, recR, drv8c0, drv880, sizetbl */
+                    + OG_LIBMPR_SITE_COUNT + OG_AVCAM_BLOB_COUNT + OG_AVCAM_HPATCH_COUNT;
 
     if (pre_errs != 0U) {
         out_s("RESULT=ABORT_MISMATCH pre_errors="); out_u64(pre_errs); out_s(" writes=0\n");
         goto cleanup;
     }
     if (to_apply == 0U) {
-        out_s("RESULT=NOTHING_TO_DO sites=142 writes=0\n");
+        out_s("RESULT=NOTHING_TO_DO sites="); out_u64(total_sites); out_s(" writes=0\n");
         goto cleanup;
     }
     out_s("PASS1_PREIMAGE=OK sites_to_write="); out_u64(to_apply); out_s("\n");
@@ -810,7 +861,8 @@ __attribute__((visibility("default"))) void _init(void) {
     g_touched_drv_8c0 = 0; g_touched_drv_880 = 0;
     g_touched_sizetbl = 0;
     for (u32 i = 0; i < OG_LIBMPR_SITE_COUNT; i++) g_touched_lm[i] = 0;
-    for (u32 i = 0; i < OG_AVCAM_PATCH_COUNT; i++) g_touched_av[i] = 0;
+    for (u32 i = 0; i < OG_AVCAM_BLOB_COUNT; i++) g_touched_av_blob[i] = 0;
+    for (u32 i = 0; i < OG_AVCAM_HPATCH_COUNT; i++) g_touched_av_h[i] = 0;
 
     int apply_err = 0;
 
@@ -881,14 +933,24 @@ __attribute__((visibility("default"))) void _init(void) {
         g_touched_lm[i] = 1;
         if (!cow_write_libmpr(s->file_off, s->target, s->len)) apply_err = 1;
     }
-    for (u32 i = 0; i < OG_AVCAM_PATCH_COUNT && !apply_err; i++) {
-        const struct og_av_patch *p = &OG_AVCAM_PATCHES[i];
+    for (u32 i = 0; i < OG_AVCAM_BLOB_COUNT && !apply_err; i++) {
+        const struct og_av_patch *p = &OG_AVCAM_BLOBS[i];
         u8 *dst = av_map + p->file_off;
         if (mem_eq(dst, p->target, p->len)) continue;
-        g_touched_av[i] = 1;
+        g_touched_av_blob[i] = 1;
         for (u8 k = 0; k < p->len; k++) dst[k] = p->target[k];
         mem_barrier_sy();
         if (!mem_eq(dst, p->target, p->len)) apply_err = 1;
+    }
+    for (u32 i = 0; i < OG_AVCAM_HPATCH_COUNT && !apply_err; i++) {
+        const struct og_av_hpatch *hp = &OG_AVCAM_HPATCHES[i];
+        u8 len = hp->is_u32 ? 4U : 2U;
+        u8 *dst = av_map + hp->file_off;
+        if (mem_eq(dst, OG_H2560_BYTES, len)) continue;
+        g_touched_av_h[i] = 1;
+        for (u8 k = 0; k < len; k++) dst[k] = OG_H2560_BYTES[k];
+        mem_barrier_sy();
+        if (!mem_eq(dst, OG_H2560_BYTES, len)) apply_err = 1;
     }
 
     if (apply_err) {
@@ -897,7 +959,7 @@ __attribute__((visibility("default"))) void _init(void) {
         goto cleanup;
     }
 
-    /* ==== PASS 3: Full End-to-End Readback Verification (All 147 Sites) ===== */
+    /* ==== PASS 3: Full End-to-End Readback Verification ===================== */
     u32 rb_errs = 0;
     for (u32 i = 0; i < OG_DMM_SITE_COUNT; i++) {
         const struct og_dmm_site *d = &OG_DMM_SITES[i];
@@ -931,9 +993,14 @@ __attribute__((visibility("default"))) void _init(void) {
         u64 va = find_mapped_slice("/libmpr.so", s->file_off, s->len, 1u, 0, 0, 0);
         if (!va || !mem_eq((const u8 *)va, s->target, s->len)) rb_errs++;
     }
-    for (u32 i = 0; i < OG_AVCAM_PATCH_COUNT; i++) {
-        const struct og_av_patch *p = &OG_AVCAM_PATCHES[i];
+    for (u32 i = 0; i < OG_AVCAM_BLOB_COUNT; i++) {
+        const struct og_av_patch *p = &OG_AVCAM_BLOBS[i];
         if (!mem_eq(av_map + p->file_off, p->target, p->len)) rb_errs++;
+    }
+    for (u32 i = 0; i < OG_AVCAM_HPATCH_COUNT; i++) {
+        const struct og_av_hpatch *hp = &OG_AVCAM_HPATCHES[i];
+        u8 len = hp->is_u32 ? 4U : 2U;
+        if (!mem_eq(av_map + hp->file_off, OG_H2560_BYTES, len)) rb_errs++;
     }
 
     if (rb_errs != 0U) {
@@ -942,8 +1009,8 @@ __attribute__((visibility("default"))) void _init(void) {
         goto cleanup;
     }
 
-    out_s("PASS3_READBACK=OK sites=142\n");
-    out_s("RESULT=APPLY_OK design=dmmwb3976_all7+ogsq_v6_3968_pal50safe+outsz2560+ogfile2560+lcdfill_v2 raster=3840x2560\n");
+    out_s("PASS3_READBACK=OK sites="); out_u64(total_sites); out_s("\n");
+    out_s("RESULT=APPLY_OK design=v6_1_3968_alli_mp4hdr32_lcdfill raster=3840x2560\n");
 
 cleanup:
     sys_munmap((void *)av_map_raw, OG_AVCAM_PATCH_MAP_HI);

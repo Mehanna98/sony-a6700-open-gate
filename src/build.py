@@ -27,9 +27,11 @@ TARGETS = [
     ("a6700_shutter_ram",  SRC_DIR / "a6700_features_ram.c", OUT_DIR / "a6700_shutter_ram.so",  ["-DFEAT_MASK=1"]),
     ("a6700_exposure_ram", SRC_DIR / "a6700_features_ram.c", OUT_DIR / "a6700_exposure_ram.so", ["-DFEAT_MASK=2"]),
     ("a6700_ftp_ram",      SRC_DIR / "a6700_features_ram.c", OUT_DIR / "a6700_ftp_ram.so",      ["-DFEAT_MASK=4"]),
-    ("a6700_fl23_ram",     SRC_DIR / "a6700_fl23_ram.c",     OUT_DIR / "a6700_fl23_ram.so",     []),
-    ("a6700_og_probe_ro",  SRC_DIR / "a6700_og_probe_ro.c",  OUT_DIR / "a6700_og_probe_ro.so",  []),
-    ("a6700_og_ram",       SRC_DIR / "a6700_og_ram.c",       OUT_DIR / "a6700_og_ram.so",       []),
+    ("a6700_fl23_ram",         SRC_DIR / "a6700_fl23_ram.c",         OUT_DIR / "a6700_fl23_ram.so",         []),
+    ("a6700_fuji_ram",         SRC_DIR / "a6700_fuji_ram.c",         OUT_DIR / "a6700_fuji_ram.so",         []),
+    ("a6700_cc_restore_stock", SRC_DIR / "a6700_cc_restore_stock.c", OUT_DIR / "a6700_cc_restore_stock.so", []),
+    ("a6700_og_probe_ro",      SRC_DIR / "a6700_og_probe_ro.c",      OUT_DIR / "a6700_og_probe_ro.so",      []),
+    ("a6700_og_ram",           SRC_DIR / "a6700_og_ram.c",           OUT_DIR / "a6700_og_ram.so",           []),
 ]
 
 
