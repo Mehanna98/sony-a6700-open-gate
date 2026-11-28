@@ -1,0 +1,2 @@
+-r ../windows/requirements.txt
+libusb-package>=1.0.26

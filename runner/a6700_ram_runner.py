@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""a6700_ram_runner.py -- Portable zero-flash RAM-only runner for Sony ILCE-6700 (FW v2.00).
+"""a6700_ram_runner.py -- Portable zero-flash RAM-only runner for Project Wildcard a6700 (FW v2.00).
+
+Supports macOS (Apple Silicon + Intel, zero Homebrew required) and Windows (libusb-win32).
 
 Safety guarantees enforced on EVERY session:
   1. Verifies every payload's exact SHA-256 against payloads/manifest.json + ELF header checks
      (AArch64 ET_DYN, DT_INIT != 0, DT_NEEDED == 0, < 65,536 B, zero flash paths) before touching USB.
-  2. Refuses to proceed if leftover files exist in /tmp/jiritsu/ (unless --clean is explicitly run).
-  3. Stages to stage.so and verifies full SHA-256 readback BEFORE triggering libJit.so.
-  4. Saves timestamped camera reports to logs/ (gitignored) and deletes all temporary files
+  2. On macOS, walks the full I/O Registry (including USB hubs/docks) and safely unmounts the
+     camera's SD card via `diskutil unmountDisk` BEFORE detaching Apple's mass-storage driver.
+  3. Refuses to proceed if leftover files exist in /tmp/jiritsu/ (unless --clean is explicitly run).
+  4. Stages to stage.so and verifies full SHA-256 readback BEFORE triggering libJit.so.
+  5. Saves timestamped camera reports to logs/ (gitignored) and deletes all temporary files
      in /tmp/jiritsu/ in the same session.
-  5. 100% volatile RAM-only: power cycling / removing the battery reverts 100% to factory stock.
+  6. 100% volatile RAM-only: a 10-second battery pull always returns the camera to 100% factory stock.
 """
 from __future__ import annotations
 
@@ -17,8 +21,11 @@ import datetime as dt
 import hashlib
 import json
 import os
+import plistlib
 import struct
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 RUNNER_DIR = Path(__file__).resolve().parent
@@ -30,6 +37,7 @@ LOGS_DIR = REPO_ROOT / "logs"
 PMCA_DIR = RUNNER_DIR / "third_party" / "sony-pmca-re"
 JIRITSU_DIR = RUNNER_DIR / "third_party" / "firehydrant"
 
+SONY_VID = 0x054C
 STAGE_NAME = "stage.so"
 TRIGGER_NAME = "libJit.so"
 RESULT_NAME = "rampatch.result"
@@ -95,6 +103,159 @@ def verify_elf_payload(path: Path, expected_sha: str | None = None) -> dict:
     return {"file": str(path), "size": len(data), "sha256": sha, "dt_init": hex(dt_init), "dt_needed": dt_needed}
 
 
+# ---------------------------------------------------------------------------
+# macOS USB support: bundled libusb-package + safe I/O Registry disk unmount
+# ---------------------------------------------------------------------------
+
+def _setup_macos_libusb() -> str:
+    """Bind pyusb's libusb1 backend on macOS without relying on DYLD_LIBRARY_PATH.
+
+    macOS SIP strips DYLD_LIBRARY_PATH when sudo runs. Loading libusb-package's bundled
+    wheel first (or probing Homebrew's absolute dylib path via find_library) caches the
+    libusb1 backend inside pyusb before PMCA-RE calls usb.core.find().
+    """
+    try:
+        import libusb_package  # type: ignore
+
+        backend = libusb_package.get_libusb1_backend()
+        if backend is not None:
+            return "libusb-package"
+    except ImportError:
+        pass
+
+    import usb.backend.libusb1 as libusb1
+
+    for cand in (
+        "/opt/homebrew/lib/libusb-1.0.dylib",
+        "/usr/local/lib/libusb-1.0.dylib",
+        "/opt/local/lib/libusb-1.0.dylib",
+    ):
+        if os.path.isfile(cand):
+            backend = libusb1.get_backend(find_library=lambda _name, p=cand: p)
+            if backend is not None:
+                return cand
+
+    backend = libusb1.get_backend()
+    return "system-libusb" if backend is not None else "none"
+
+
+def _walk_ioreg(node: dict):
+    yield node
+    for child in node.get("IORegistryEntryChildren", []):
+        if isinstance(child, dict):
+            yield from _walk_ioreg(child)
+
+
+def ioreg_sony_devices(run_fn=None) -> list[dict]:
+    """Read-only walk of the macOS I/O Registry for Sony USB devices (direct or behind hubs)."""
+    runner = run_fn or subprocess.run
+    try:
+        res = runner(
+            ["ioreg", "-a", "-r", "-c", "IOUSBHostDevice", "-l"],
+            capture_output=True,
+            timeout=30,
+        )
+        out = res.stdout or b""
+        tops = plistlib.loads(out) if out.strip() else []
+    except Exception as exc:
+        return [{"error": str(exc)}]
+
+    rows: list[dict] = []
+    for top in tops:
+        if not isinstance(top, dict):
+            continue
+        for dev in _walk_ioreg(top):
+            if dev.get("IOObjectClass") != "IOUSBHostDevice" or dev.get("idVendor") != SONY_VID:
+                continue
+            ifaces = [
+                n for n in dev.get("IORegistryEntryChildren", [])
+                if isinstance(n, dict) and n.get("IOObjectClass") == "IOUSBHostInterface"
+            ]
+            drivers = [
+                d.get("IOObjectClass")
+                for iface in ifaces
+                for d in iface.get("IORegistryEntryChildren", [])
+                if isinstance(d, dict) and d.get("IOObjectClass")
+            ]
+            disks = sorted({
+                n["BSD Name"]
+                for n in _walk_ioreg(dev)
+                if n.get("IOObjectClass") == "IOMedia" and n.get("Whole") and n.get("BSD Name")
+            })
+            rows.append({
+                "vid": SONY_VID,
+                "pid": int(dev.get("idProduct", 0)),
+                "location_id": int(dev.get("locationID", 0)),
+                "name": dev.get("USB Product Name") or "Sony USB Device",
+                "classes": [i.get("bInterfaceClass") for i in ifaces],
+                "drivers": list(dict.fromkeys(drivers)),
+                "disks": disks,
+            })
+    return rows
+
+
+def prepare_macos_usb(
+    svc_pid: int = 0x0336,
+    euid_fn=None,
+    run_fn=None,
+    sleep_fn=None,
+) -> list[str]:
+    """Safely unmount Sony camera SD card(s) on macOS before libusb detaches Apple's MSC driver.
+
+    Unmount only (`diskutil unmountDisk`): never writes to the card and never ejects the USB device.
+    Returns the list of unmounted BSD disk names (empty if camera is already in Service Mode
+    or has no card mounted).
+    """
+    get_euid = euid_fn or getattr(os, "geteuid", lambda: 0)
+    runner = run_fn or subprocess.run
+    sleeper = sleep_fn or time.sleep
+
+    rows = ioreg_sony_devices(run_fn=runner)
+    if not rows or any("error" in r for r in rows):
+        err = rows[0]["error"] if rows else "no Sony USB device listed"
+        raise RuntimeError(
+            f"[macOS] Sony camera not found in macOS I/O Registry ({err}).\n"
+            "        Make sure your a6700 is turned ON, plugged into your Mac via USB,\n"
+            "        and set to USB Connection Mode -> Mass Storage (MSC)."
+        )
+
+    if all(r["pid"] == svc_pid for r in rows):
+        print(f"[macOS] Sony Service Mode (054C:{svc_pid:04X}) already active -- no disk unmount needed.")
+        return []
+
+    if get_euid() != 0:
+        raise RuntimeError(
+            "[macOS] Admin rights (sudo) are required so macOS lets go of its USB mass-storage driver.\n"
+            "        Run ./mac/Project_Wildcard_a6700.command (it prompts for your Mac password automatically)."
+        )
+
+    unmounted: list[str] = []
+    for row in rows:
+        if row["pid"] == svc_pid:
+            continue
+        disks_label = ", ".join(row["disks"]) if row["disks"] else "none"
+        print(f"[macOS] Found {row['name']} (054C:{row['pid']:04X}), disks={disks_label}")
+        for disk in row["disks"]:
+            res = runner(
+                ["diskutil", "unmountDisk", f"/dev/{disk}"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            detail = ((res.stdout or "") + " " + (res.stderr or "")).strip()
+            if res.returncode != 0:
+                raise RuntimeError(
+                    f"[macOS] Could not unmount the camera's SD card (/dev/{disk}: {detail}).\n"
+                    "        Close Finder windows, Photos, or Image Capture showing the camera card and try again."
+                )
+            print(f"[macOS] Unmounted camera SD card (/dev/{disk}) cleanly.")
+            unmounted.append(disk)
+
+    if unmounted:
+        sleeper(0.3)
+    return unmounted
+
+
 def _import_transport():
     if not PMCA_DIR.is_dir():
         raise SystemExit(f"Missing vendored sony-pmca-re at {PMCA_DIR}")
@@ -106,12 +267,22 @@ def _import_transport():
             sys.path.insert(0, d)
     import usb.core  # noqa: F401
     import Cryptodome  # noqa: F401
+
+    if sys.platform == "darwin":
+        backend_src = _setup_macos_libusb()
+        if backend_src == "none":
+            print(
+                "[WARN] pyusb could not find libusb on macOS. Re-run ./mac/setup_mac.command "
+                "(installs libusb-package automatically).",
+                file=sys.stderr,
+            )
+
     import jiritsu  # type: ignore
     return jiritsu
 
 
 def _install_clean_senser_reader(ch) -> None:
-    """Clean 1024-byte-aligned reader for Windows libusb-win32 service packets > 32 KiB."""
+    """Clean 1024-byte-aligned reader for service packets > 32 KiB (safe on macOS libusb1 & Windows libusb-win32)."""
     dev = getattr(ch, "channel", None)
     drv = getattr(dev, "driver", None)
     if dev is None or drv is None:
@@ -173,9 +344,140 @@ def _install_clean_senser_reader(ch) -> None:
     dev.sendSenserPacket = _clean_send_senser_packet
 
 
+def _dispose_driver(drv) -> None:
+    """Release pyusb handle cleanly so macOS/Windows does not keep stale USB references."""
+    dev = getattr(getattr(drv, "backend", None), "dev", None) or getattr(drv, "dev", None)
+    if dev is None:
+        return
+    try:
+        import usb.util
+
+        usb.util.dispose_resources(dev)
+    except Exception:
+        pass
+
+
+def _make_channel(jiritsu, allowed):
+    """Create a macOS-safe, diagnostic-friendly Jiritsu Channel without modifying vendored libs."""
+    if not hasattr(jiritsu, "_open_contexts"):
+        return jiritsu.Channel(allowed=allowed)
+
+    class _WildcardChannel(jiritsu.Channel):
+        def __enter__(self):
+            if sys.platform == "darwin":
+                prepare_macos_usb(svc_pid=jiritsu.SVC_PID)
+
+            self.ctxs = jiritsu._open_contexts()
+            devs = jiritsu._list_sony(self.ctxs)
+            jiritsu.log(f"visible Sony devices: {len(devs)}")
+            for drv in devs:
+                jiritsu.log(f"  id = {drv.getId()}")
+
+            svc = [d for d in devs if d.getId()[1] == jiritsu.SVC_PID]
+            if svc:
+                jiritsu.log("service identity already present -- authenticating directly")
+                self.auth = jiritsu._authenticate(svc[0])
+                self.drv = svc[0]
+            else:
+                msc = None
+                last_err = None
+                for drv in devs:
+                    if not isinstance(drv, (jiritsu.MscBbbDriver, jiritsu.GenericUsbDriver)):
+                        continue
+                    try:
+                        info = jiritsu.MscDevice(drv).getDeviceInfo()
+                        man = getattr(info, "manufacturer", "")
+                        if isinstance(man, (bytes, bytearray)):
+                            man = man.decode("utf-8", "ignore")
+                        if "Sony" in str(man):
+                            msc = drv
+                            jiritsu.log(
+                                f"MSC device: pid=0x{drv.getId()[1]:04X} model={getattr(info, 'model', '?')}"
+                            )
+                            break
+                    except Exception as exc:
+                        last_err = exc
+                        jiritsu.log(f"  MSC probe on {drv.getId()} failed: {exc!r}")
+                        continue
+
+                if msc is None:
+                    detail = f" (last USB error: {last_err})" if last_err else ""
+                    if sys.platform == "darwin":
+                        hint = (
+                            "Make sure you ran via ./mac/Project_Wildcard_a6700.command (sudo), "
+                            "closed Finder/Photos/Image Capture, and set USB Connection Mode -> Mass Storage (MSC)."
+                        )
+                    else:
+                        hint = (
+                            "Set the camera to Mass Storage (MSC) mode, replug USB, and make sure "
+                            "libusb-win32 is installed via Zadig."
+                        )
+                    raise RuntimeError(f"no Sony MSC camera and no service identity{detail}. {hint}")
+
+                jiritsu.log("asking the camera to raise the service identity ...")
+                auth = jiritsu.SonySenserAuthDevice(msc)
+                try:
+                    auth.start()
+                except Exception as exc:
+                    jiritsu.log(f"start warning: {exc!r}")
+
+                r1_note = None
+                try:
+                    auth.authenticate()
+                    jiritsu.log("round 1 authentication passed")
+                except Exception as exc:
+                    # On some macOS / USB-C controllers, the camera starts re-enumerating to 0x0336
+                    # right at the end of Round 1, closing the MSC pipe early. Poll for 0x0336!
+                    r1_note = repr(exc)
+                    jiritsu.log(f"round 1 exchange ended early ({r1_note}); polling for 0x{jiritsu.SVC_PID:04X} ...")
+
+                try:
+                    auth.stop()
+                except Exception:
+                    pass
+                _dispose_driver(msc)
+
+                deadline = time.time() + self.wait
+                while time.time() < deadline:
+                    time.sleep(0.75)
+                    for drv in jiritsu._list_sony(self.ctxs, quiet=True):
+                        if drv.getId()[1] != jiritsu.SVC_PID:
+                            continue
+                        try:
+                            self.auth = jiritsu._authenticate(drv)
+                            self.drv = drv
+                            break
+                        except Exception as exc:
+                            jiritsu.log(f"  0x{jiritsu.SVC_PID:04X} authentication failed {exc!r}, retrying")
+                    else:
+                        continue
+                    break
+                else:
+                    extra = f" (round 1 note: {r1_note})" if r1_note else ""
+                    if sys.platform == "win32":
+                        extra += " -- on Windows first run, install libusb-win32 for PID 0336 in Zadig and retry."
+                    raise RuntimeError(f"service identity 0x{jiritsu.SVC_PID:04X} did not appear within {self.wait} s{extra}")
+                jiritsu.log("round 2 authentication passed")
+
+            jiritsu._set_timeout(self.drv)
+            self.channel = jiritsu.SonySenserDevice(self.auth.driver)
+            _install_clean_senser_reader(self)
+            return self
+
+        def __exit__(self, *args):
+            try:
+                super().__exit__(*args)
+            finally:
+                _dispose_driver(getattr(self, "drv", None))
+
+    return _WildcardChannel(allowed=allowed)
+
+
 def cmd_dry_run() -> None:
-    print("=== OFFLINE SAFETY & PAYLOAD CHECK (ZERO USB CONTACT) ===")
+    print("=== PROJECT WILDCARD a6700 -- OFFLINE PAYLOAD CHECK (ZERO USB CONTACT) ===")
     jiritsu = _import_transport()
+    if sys.platform == "darwin":
+        print(f"[OK] macOS libusb backend: {_setup_macos_libusb()}")
     print(f"[OK] USB transport ready (MSC={jiritsu.MSC_PID:#06x}, SVC={jiritsu.SVC_PID:#06x})")
     pinned = load_manifest_hashes()
     for fname, exp_sha in pinned.items():
@@ -183,7 +485,7 @@ def cmd_dry_run() -> None:
         if not p.is_file():
             raise SystemExit(f"[FAIL] Missing payload: {p}")
         info = verify_elf_payload(p, expected_sha=exp_sha)
-        print(f"[OK] {fname:24s} {info['size']:6,d} B  DT_INIT={info['dt_init']}  sha256={info['sha256'][:16]}...")
+        print(f"[OK] {fname:26s} {info['size']:6,d} B  DT_INIT={info['dt_init']}  sha256={info['sha256'][:16]}...")
     print(f"=== ALL {len(pinned)} PAYLOADS VERIFIED (0 USB CALLS MADE) ===")
 
 
@@ -198,6 +500,8 @@ def _print_recovery_hints(text: str) -> None:
         )
     elif "RESULT=ALREADY_APPLIED" in text or "RESULT=NOTHING_TO_DO" in text:
         print("[OK] Already active in camera RAM (0 bytes modified).")
+    elif "RESULT=ALREADY_INSTALLED" in text:
+        print("[OK] Native Wildcard & Creative Looks menus are already active in RAM (0 bytes modified).")
     elif "RESULT=RESTORE_STOCK_OK" in text:
         print(
             "[NEXT] Unplug USB, power the camera OFF normally once (saves clean stock Creative Look\n"
@@ -216,21 +520,21 @@ def _cleanup_channel_files(ch) -> None:
             print(f"[WARN] Cleanup failed for {fn}: {exc}", file=sys.stderr)
 
 
-def _run_live_session(so_name: str, label: str) -> str:
+def _run_live_session(so_name: str, label: str, jiritsu_mod=None) -> str:
     pinned = load_manifest_hashes()
     so_path = PAYLOAD_DIR / so_name
     info = verify_elf_payload(so_path, expected_sha=pinned.get(so_name))
     print(f"[PREFLIGHT] Verified {so_path.name}: {info['size']:,} B, sha256={info['sha256'][:16]}...")
 
     blob = so_path.read_bytes()
-    jiritsu = _import_transport()
+    jiritsu = jiritsu_mod if jiritsu_mod is not None else _import_transport()
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = LOGS_DIR / f"{ts}_{label}.txt"
 
     allowed = (STAGE_NAME, TRIGGER_NAME, RESULT_NAME)
     text = ""
-    with jiritsu.Channel(allowed=allowed) as ch:
+    with _make_channel(jiritsu, allowed) as ch:
         _install_clean_senser_reader(ch)
         stale = [fn for fn in allowed if ch.read(fn, missing=True) is not None]
         if stale:
@@ -257,51 +561,34 @@ def _run_live_session(so_name: str, label: str) -> str:
     return text
 
 
-def cmd_clean() -> None:
-    jiritsu = _import_transport()
-    allowed = (STAGE_NAME, TRIGGER_NAME, RESULT_NAME)
-    with jiritsu.Channel(allowed=allowed) as ch:
-        _install_clean_senser_reader(ch)
-        for fn in allowed:
-            if ch.read(fn, missing=True) is not None:
-                ch.remove(fn)
-                print(f"[CLEAN] Removed /tmp/jiritsu/{fn}")
-            else:
-                print(f"[OK] /tmp/jiritsu/{fn} already clean")
-
-
-def cmd_combo(use_fuji: bool = False) -> None:
-    """True 1-Plug All-in-One: stacks Open Gate v6.1 + Cine EI v2.2 + FX2 FL2/FL3 (or Fuji 4-Sim) in ONE USB session."""
-    look_step = (
-        ("Fujifilm 4-Sim Pack (FL/VV2/IN/SH)", "a6700_fuji_ram.so", "combo_3_fuji")
-        if use_fuji
-        else ("FX2 FL2 (IN) & FL3 (SH)", "a6700_fl23_ram.so", "combo_3_fl23")
-    )
-    steps = [
-        ("Open Gate v6.1 (4K 24p/25p 3:2)", "a6700_og_ram.so", "combo_1_og_ram"),
-        ("Cine EI v2.2 (Base ISO 800/2500)", "a6700_cine_ei_ram.so", "combo_2_cine_ei"),
-        look_step,
-    ]
+def _run_multi_session(
+    banner_title: str,
+    steps: list[tuple[str, str, str]],
+    done_lines: list[str],
+    jiritsu_mod=None,
+) -> list[tuple[str, str]]:
+    """Run multiple verified payloads sequentially inside ONE single USB session."""
     pinned = load_manifest_hashes()
     prepared: list[tuple[str, str, bytes]] = []
     for title, so_name, label in steps:
         so_path = PAYLOAD_DIR / so_name
         info = verify_elf_payload(so_path, expected_sha=pinned.get(so_name))
-        print(f"[PREFLIGHT] {title:34s} -> {so_name} ({info['size']:,} B, sha256={info['sha256'][:12]}...)")
+        print(f"[PREFLIGHT] {title:40s} -> {so_name} ({info['size']:,} B, sha256={info['sha256'][:12]}...)")
         prepared.append((title, label, so_path.read_bytes()))
 
     print("\n============================================================")
-    print("  Sony a6700 (FW v2.00) -- 1-PLUG ALL-IN-ONE COMBO (v6.1)")
-    print("  Running all 3 modules inside ONE single USB session (~17s).")
-    print("  Do NOT unplug USB until ALL 3 complete!")
+    print(f"  {banner_title}")
+    print(f"  Running {len(prepared)} modules inside ONE single USB session (~10-15s).")
+    print("  Do NOT unplug USB until all modules complete!")
     print("============================================================\n")
 
-    jiritsu = _import_transport()
+    jiritsu = jiritsu_mod if jiritsu_mod is not None else _import_transport()
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     allowed = (STAGE_NAME, TRIGGER_NAME, RESULT_NAME)
+    results: list[tuple[str, str]] = []
 
-    with jiritsu.Channel(allowed=allowed) as ch:
+    with _make_channel(jiritsu, allowed) as ch:
         _install_clean_senser_reader(ch)
         stale = [fn for fn in allowed if ch.read(fn, missing=True) is not None]
         if stale:
@@ -311,7 +598,7 @@ def cmd_combo(use_fuji: bool = False) -> None:
         try:
             total = len(prepared)
             for idx, (title, label, blob) in enumerate(prepared, start=1):
-                print(f"\n=== [COMBO {idx}/{total}] {title} ===")
+                print(f"\n=== [STEP {idx}/{total}] {title} ===")
                 raw_res, _ = ch.run_module(
                     blob=blob,
                     stage_name=STAGE_NAME,
@@ -327,11 +614,13 @@ def cmd_combo(use_fuji: bool = False) -> None:
                 print(text.rstrip())
                 print("------ CAMERA REPORT END ------")
                 _print_recovery_hints(text)
+                results.append((title, text))
                 _cleanup_channel_files(ch)
 
                 ok = (
                     "RESULT=APPLY_OK" in text
                     or "RESULT=ALREADY_APPLIED" in text
+                    or "RESULT=ALREADY_INSTALLED" in text
                     or "RESULT=NOTHING_TO_DO" in text
                 )
                 if not ok:
@@ -343,39 +632,103 @@ def cmd_combo(use_fuji: bool = False) -> None:
             _cleanup_channel_files(ch)
 
     print("\n============================================================")
-    print("  ALL 3 FEATURES ARE NOW LIVE IN RAM (1 USB SESSION)!")
-    print("  Unplug USB and switch to Movie (XAVC HS / S / S-I 4K 25p or 24p).")
-    if use_fuji:
-        print("  Creative Looks: FL=Classic Chrome, VV2=Classic Neg, IN=Nostalgic Neg, SH=Eterna.")
-    else:
-        print("  Creative Looks: IN=FX2 FL2, SH=FX2 FL3.")
+    for line in done_lines:
+        print(f"  {line}")
     print("============================================================")
+    return results
+
+
+def cmd_wildcard(jiritsu_mod=None) -> list[tuple[str, str]]:
+    """Install Project Wildcard a6700 native menus (Wildcard + Creative Looks 8-Sim Fuji / FX2 / Stock)."""
+    return _run_multi_session(
+        banner_title="PROJECT WILDCARD a6700 (FW v2.00) -- NATIVE RAM MENUS",
+        steps=[
+            ("Creative Looks Pack (Stock / FX2 / Fuji 8-Sim)", "a6700_looks_pack_ram.so", "wildcard_1_looks_pack"),
+            ("Native Wildcard + Creative Looks Menus",         "a6700_og_menu_ram.so",    "wildcard_2_menus"),
+        ],
+        done_lines=[
+            "PROJECT WILDCARD a6700 IS LIVE IN CAMERA RAM!",
+            "You can unplug USB now. Open your camera menus:",
+            "  1. Setup -> Operation Customize -> Wildcard",
+            "     (4K Open Gate 3:2 | SD Speed Bypass | Power-Off Shutter | Cine EI)",
+            "  2. Exposure/Color -> Color/Tone -> Creative Looks",
+            "     (Stock | FX2 FL2/FL3 | Fujifilm 8-Sim with live full names)",
+        ],
+        jiritsu_mod=jiritsu_mod,
+    )
+
+
+def cmd_clean(jiritsu_mod=None) -> None:
+    jiritsu = jiritsu_mod if jiritsu_mod is not None else _import_transport()
+    allowed = (STAGE_NAME, TRIGGER_NAME, RESULT_NAME)
+    with _make_channel(jiritsu, allowed) as ch:
+        _install_clean_senser_reader(ch)
+        for fn in allowed:
+            if ch.read(fn, missing=True) is not None:
+                ch.remove(fn)
+                print(f"[CLEAN] Removed /tmp/jiritsu/{fn}")
+            else:
+                print(f"[OK] /tmp/jiritsu/{fn} already clean")
+
+
+def cmd_combo(use_fuji: bool = False, jiritsu_mod=None) -> list[tuple[str, str]]:
+    """Legacy 1-Plug direct combo: Open Gate + Cine EI + FX2 FL2/FL3 (or Fujifilm 8-Sim) without native menus."""
+    look_step = (
+        ("Fujifilm 8-Sim Pack (Provia..Acros)", "a6700_fuji_ram.so", "combo_3_fuji")
+        if use_fuji
+        else ("FX2 FL2 (IN) & FL3 (SH)", "a6700_fl23_ram.so", "combo_3_fl23")
+    )
+    return _run_multi_session(
+        banner_title="Sony a6700 (FW v2.00) -- DIRECT 1-PLUG COMBO",
+        steps=[
+            ("Open Gate (4K 24p/25p/50p 3:2)", "a6700_og_ram.so",      "combo_1_og_ram"),
+            ("Cine EI v2.2 (Base ISO 800/2500)", "a6700_cine_ei_ram.so", "combo_2_cine_ei"),
+            look_step,
+        ],
+        done_lines=[
+            "ALL 3 MODULES ARE LIVE IN RAM (1 USB SESSION)!",
+            "Unplug USB and switch to Movie (XAVC HS / S / S-I 4K).",
+            (
+                "Creative Looks: ST=Provia, PT=Astia, VV=Velvia, VV2=Classic Neg, FL=Classic Chrome, IN=Pro Neg Hi, SH=Eterna, BW=Acros."
+                if use_fuji
+                else "Creative Looks: IN=FX2 FL2, SH=FX2 FL3."
+            ),
+        ],
+        jiritsu_mod=jiritsu_mod,
+    )
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Safe zero-flash RAM-only runner for Sony ILCE-6700 (FW v2.00)")
+    ap = argparse.ArgumentParser(description="Project Wildcard a6700 -- Zero-flash RAM-only runner (FW v2.00)")
     g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--wildcard",      action="store_true", help="Install Project Wildcard native menus (Wildcard + Creative Looks 8-Sim Fuji / FX2 / Stock)")
+    g.add_argument("--og-menu",       action="store_true", help="Alias for --wildcard")
     g.add_argument("--dry-run",       action="store_true", help="Verify all payloads & Python USB stack offline (no USB)")
+    g.add_argument("--clean",         action="store_true", help="Remove any leftover temp files in /tmp/jiritsu/")
+    g.add_argument("--restore-looks", action="store_true", help="Restore Creative Look CP tables & cache to 100%% factory stock")
     g.add_argument("--probe",         action="store_true", help="Read-only AP-RAM safety check (Cine EI / Pro Pack)")
     g.add_argument("--og-probe",      action="store_true", help="Read-only CP-RAM safety check (Open Gate / Creative Looks)")
-    g.add_argument("--open-gate",     action="store_true", help="Apply RAM-only Open Gate v6.1 (4K 24p/25p 3:2 HS/S/S-I; 50p stays stock)")
-    g.add_argument("--cine-ei",       action="store_true", help="Apply RAM-only Cine EI v2.2 (Base ISO 800/2500, strict idempotent)")
-    g.add_argument("--fl23",          action="store_true", help="Apply RAM-only FX2 FL2 (IN) & FL3 (SH) Creative Looks")
-    g.add_argument("--fuji",          action="store_true", help="Apply RAM-only 4 Hardware Fujifilm Film Sims (FL/VV2/IN/SH)")
-    g.add_argument("--combo",         action="store_true", help="1-Plug Combo: Open Gate v6.1 + Cine EI v2.2 + FX2 FL2/FL3")
-    g.add_argument("--combo-fuji",    action="store_true", help="1-Plug Combo: Open Gate v6.1 + Cine EI v2.2 + 4 Fujifilm Film Sims")
-    g.add_argument("--restore-looks", action="store_true", help="Restore Creative Look CP tables & cache to 100%% factory stock")
+    g.add_argument("--open-gate",     action="store_true", help="Apply RAM-only Open Gate (4K 3:2) directly without menu")
+    g.add_argument("--og-off",        action="store_true", help="Revert Open Gate RAM sites back to stock 16:9")
+    g.add_argument("--sd-bypass",     action="store_true", help="Apply RAM-only SD Card Speed-Limit Bypass directly")
+    g.add_argument("--sd-bypass-off", action="store_true", help="Restore stock SD Card Speed-Limit check")
+    g.add_argument("--cine-ei",       action="store_true", help="Apply RAM-only Cine EI v2.2 directly")
+    g.add_argument("--fl23",          action="store_true", help="Apply RAM-only FX2 FL2 (IN) & FL3 (SH) directly")
+    g.add_argument("--fuji",          action="store_true", help="Apply RAM-only Fujifilm 8-Sim Pack directly")
+    g.add_argument("--combo",         action="store_true", help="Direct 1-Plug Combo: Open Gate + Cine EI + FX2 FL2/FL3")
+    g.add_argument("--combo-fuji",    action="store_true", help="Direct 1-Plug Combo: Open Gate + Cine EI + Fujifilm 8-Sim Pack")
     g.add_argument("--pro-pack",      action="store_true", help="Apply RAM-only Pro Pack (Shutter Curtain + Flex Exp + FTP)")
     g.add_argument("--shutter",       action="store_true", help="Apply RAM-only Power-Off Shutter Curtain")
     g.add_argument("--exposure",      action="store_true", help="Apply RAM-only Flexible Exposure")
     g.add_argument("--ftp",           action="store_true", help="Apply RAM-only Native FTP Transfer")
-    g.add_argument("--clean",         action="store_true", help="Remove any leftover temp files in /tmp/jiritsu/")
     args = ap.parse_args()
 
     if args.dry_run:
         cmd_dry_run()
     elif args.clean:
         cmd_clean()
+    elif args.wildcard or args.og_menu:
+        cmd_wildcard()
     elif args.combo:
         cmd_combo(use_fuji=False)
     elif args.combo_fuji:
@@ -386,6 +739,12 @@ def main() -> None:
         _run_live_session("a6700_og_probe_ro.so", "og_probe_ro")
     elif args.open_gate:
         _run_live_session("a6700_og_ram.so", "og_apply_ram")
+    elif args.og_off:
+        _run_live_session("a6700_og_off_ram.so", "og_off_ram")
+    elif args.sd_bypass:
+        _run_live_session("a6700_sd_bypass_ram.so", "sd_bypass_ram")
+    elif args.sd_bypass_off:
+        _run_live_session("a6700_sd_bypass_off_ram.so", "sd_bypass_off_ram")
     elif args.cine_ei:
         _run_live_session("a6700_cine_ei_ram.so", "cine_ei_ram")
     elif args.fl23:

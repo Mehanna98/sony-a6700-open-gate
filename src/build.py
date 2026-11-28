@@ -3,7 +3,7 @@
 
 Usage:
   Set ZIG_EXE env var or have `zig` (v0.13.0+) on PATH, then run:
-      python src/build.py
+      python3 src/build.py
 """
 from __future__ import annotations
 
@@ -21,17 +21,23 @@ OUT_DIR = REPO_ROOT / "payloads"
 ZIG_BIN = os.environ.get("ZIG_EXE") or shutil.which("zig")
 
 TARGETS = [
-    ("a6700_probe_ro",     SRC_DIR / "a6700_probe_ro.c",     OUT_DIR / "a6700_probe_ro.so",     []),
-    ("a6700_cine_ei_ram",  SRC_DIR / "a6700_cine_ei_ram.c",  OUT_DIR / "a6700_cine_ei_ram.so",  []),
-    ("a6700_features_ram", SRC_DIR / "a6700_features_ram.c", OUT_DIR / "a6700_features_ram.so", ["-DFEAT_MASK=7"]),
-    ("a6700_shutter_ram",  SRC_DIR / "a6700_features_ram.c", OUT_DIR / "a6700_shutter_ram.so",  ["-DFEAT_MASK=1"]),
-    ("a6700_exposure_ram", SRC_DIR / "a6700_features_ram.c", OUT_DIR / "a6700_exposure_ram.so", ["-DFEAT_MASK=2"]),
-    ("a6700_ftp_ram",      SRC_DIR / "a6700_features_ram.c", OUT_DIR / "a6700_ftp_ram.so",      ["-DFEAT_MASK=4"]),
-    ("a6700_fl23_ram",         SRC_DIR / "a6700_fl23_ram.c",         OUT_DIR / "a6700_fl23_ram.so",         []),
-    ("a6700_fuji_ram",         SRC_DIR / "a6700_fuji_ram.c",         OUT_DIR / "a6700_fuji_ram.so",         []),
-    ("a6700_cc_restore_stock", SRC_DIR / "a6700_cc_restore_stock.c", OUT_DIR / "a6700_cc_restore_stock.so", []),
-    ("a6700_og_probe_ro",      SRC_DIR / "a6700_og_probe_ro.c",      OUT_DIR / "a6700_og_probe_ro.so",      []),
-    ("a6700_og_ram",           SRC_DIR / "a6700_og_ram.c",           OUT_DIR / "a6700_og_ram.so",           []),
+    ("a6700_probe_ro",          SRC_DIR / "a6700_probe_ro.c",         OUT_DIR / "a6700_probe_ro.so",          []),
+    ("a6700_cine_ei_ram",       SRC_DIR / "a6700_cine_ei_ram.c",      OUT_DIR / "a6700_cine_ei_ram.so",       []),
+    ("a6700_features_ram",      SRC_DIR / "a6700_features_ram.c",     OUT_DIR / "a6700_features_ram.so",      ["-DFEAT_MASK=7"]),
+    ("a6700_shutter_ram",       SRC_DIR / "a6700_features_ram.c",     OUT_DIR / "a6700_shutter_ram.so",       ["-DFEAT_MASK=1"]),
+    ("a6700_exposure_ram",      SRC_DIR / "a6700_features_ram.c",     OUT_DIR / "a6700_exposure_ram.so",      ["-DFEAT_MASK=2"]),
+    ("a6700_ftp_ram",           SRC_DIR / "a6700_features_ram.c",     OUT_DIR / "a6700_ftp_ram.so",           ["-DFEAT_MASK=4"]),
+    ("a6700_fl23_ram",          SRC_DIR / "a6700_fl23_ram.c",         OUT_DIR / "a6700_fl23_ram.so",          []),
+    ("a6700_fuji_ram",          SRC_DIR / "a6700_fuji_ram.c",         OUT_DIR / "a6700_fuji_ram.so",          []),
+    ("a6700_cc_restore_stock",  SRC_DIR / "a6700_cc_restore_stock.c", OUT_DIR / "a6700_cc_restore_stock.so",  []),
+    ("a6700_og_probe_ro",       SRC_DIR / "a6700_og_probe_ro.c",      OUT_DIR / "a6700_og_probe_ro.so",       []),
+    ("a6700_pb_log_ro",         SRC_DIR / "a6700_pb_log_ro.c",        OUT_DIR / "a6700_pb_log_ro.so",         []),
+    ("a6700_og_ram",            SRC_DIR / "a6700_og_ram.c",           OUT_DIR / "a6700_og_ram.so",            []),
+    ("a6700_og_off_ram",        SRC_DIR / "a6700_og_off_ram.c",       OUT_DIR / "a6700_og_off_ram.so",        []),
+    ("a6700_looks_pack_ram",    SRC_DIR / "a6700_looks_pack_ram.c",   OUT_DIR / "a6700_looks_pack_ram.so",    ["-Os"]),
+    ("a6700_og_menu_ram",       SRC_DIR / "a6700_og_menu_ram.c",      OUT_DIR / "a6700_og_menu_ram.so",       ["-Os"]),
+    ("a6700_sd_bypass_ram",     SRC_DIR / "a6700_sd_bypass_ram.c",    OUT_DIR / "a6700_sd_bypass_ram.so",     ["-DSD_BYPASS_OFF=0"]),
+    ("a6700_sd_bypass_off_ram", SRC_DIR / "a6700_sd_bypass_ram.c",    OUT_DIR / "a6700_sd_bypass_off_ram.so", ["-DSD_BYPASS_OFF=1"]),
 ]
 
 

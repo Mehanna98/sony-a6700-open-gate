@@ -1,27 +1,25 @@
 /* a6700_fuji_ram.c -- Zero-flash, zero-code-patch, 100% volatile CP-data-only
- * True Hardware Fujifilm Film Simulations for Sony ILCE-6700 (a6700) FW v2.00.
+ * True Hardware 8-Sim Fujifilm Film Simulation Pack for Sony ILCE-6700 (a6700) FW v2.00.
  *
  * ARCHITECTURE (Zero AP code patched, ZERO CP executable instructions patched -> 0 I-cache hazard!):
- *   Creative Look FL  (params 41/45, desc 37/41, slots 26/27) -> Classic Chrome      (Still + Movie)
- *   Creative Look VV2 (params 42/46, desc 38/42, slots 28/29) -> Classic Negative    (Still + Movie)
- *   Creative Look IN  (params 43/47, desc 39/43, slots 30/31) -> Nostalgic Negative  (Still + Movie)
- *   Creative Look SH  (params 44/48, desc 40/44, slots 32/33) -> Eterna / 2383       (Still + Movie)
- *   All other 6 Creative Looks (ST / PT / NT / VV / BW / SE) remain 100% factory stock!
- *
- *   100% disjoint CP RAM memory regions from Open Gate v6.1, Cine EI v2.2, and FX2 FL2/FL3:
- *     1. Tone / Gamma curves (12 x 576 B = 6,912 B) in zero-verified CP cave 0x0010BD80..0x0010D880
- *     2. Gamma descriptors (8 x 28 B = 224 B) in CP RW .data 0x010D8A80..0x010D8B60 (desc[37..44])
- *     3. Chroma tables (0x02A40001 @ 0x016F1094): free slots 26..33 (512 B) + 8-byte pmap
- *     4. Matrix tables (0x02A4000D @ 0x016F3594): free slots 26..33 (8 x 768 B) + 8-byte pmap
+ *   ST  (params  0/21, mode[0] {0,10}->{ 2,12}, slot 22) -> Provia          (Still + Movie)
+ *   PT  (params  6/27, mode[3] {1,11}->{23,30}, slot 23) -> Astia           (Still + Movie)
+ *   VV  (params  1/22, mode[1] {8,18}->{ 9,19}, slot 24) -> Velvia          (Still + Movie)
+ *   VV2 (params 42/46, desc    38/42,           slot 25) -> Classic Neg.    (Still + Movie)
+ *   FL  (params 41/45, desc    37/41,           slot 26) -> Classic Chrome  (Still + Movie)
+ *   IN  (params 43/47, desc    39/43,           slot 27) -> Pro Neg. Hi     (Still + Movie)
+ *   SH  (params 44/48, desc    40/44,           slot 28) -> Eterna          (Still + Movie)
+ *   BW  (monochrome,   mode[5] {4,14}->{20,21}, Gamma)   -> Acros           (Still + Movie)
+ *   NT (Neutral) & SE (Sepia) remain 100% untouched Sony factory stock!
  *
  * SAFETY GUARANTEES:
  *   - 100% ZERO flash writes (/dev/nflash, /cp/cpapp, /setting/BACKUP untouched).
  *   - ZERO mprotect / ZERO pwrite64 / ZERO CP code writes.
  *   - 10-second battery pull returns the camera 100% to factory stock.
  *   - PASS 0 verifies libsencore.so / libJiritsu.so SHA-256, 3 prologues, and 3 pure-code CP pages.
- *   - PASS 1 verifies ALL 13 CP-RAM preimage regions are STOCK (or FL2/FL3, or already FUJI) before writing 1 byte.
- *   - PASS 2 writes backing data caves FIRST, then flips descriptors & param-maps LAST, with full auto-rollback.
- *   - PASS 3 re-reads all 13 regions end-to-end and only reports RESULT=APPLY_OK on 100% match.
+ *   - PASS 1 dry-verifies ALL CP-RAM preimage regions (Stock, FX2 FL2/3, Legacy 4-Sim, or 8-Sim).
+ *   - PASS 2 parks pointers to Stock FIRST, writes backing caves/aux-descs/slots, flips descs/modes/pmaps LAST.
+ *   - PASS 3 re-reads all regions end-to-end and only reports RESULT=APPLY_OK on 100% match.
  */
 #include "a6700_fuji_spec.h"
 #include "a6700_fl23_spec.h"
@@ -36,7 +34,7 @@
 #define AT_FDCWD      (-100)
 #define O_RDONLY      0
 #define O_WRONLY      1
-#define O_RDWR_SYNC   0x101002 /* O_RDWR | O_SYNC (uncached CP DMA bounce buffer) */
+#define O_RDWR_SYNC   0x101002
 #define O_CREAT       0x40
 #define O_TRUNC       0x200
 
@@ -49,6 +47,13 @@
 #define RAM_LO        0x400000000ULL
 #define RAM_HI        0x500000000ULL
 #define RESULT_PATH   "/tmp/jiritsu/rampatch.result"
+
+static const u8 LEGACY_FUJI4_U01_PMAP14[FUJI_PMAP_SPARSE_COUNT] = {
+    0x00,0x02,0x06, 0x01,0x03,0x07, 0x16,0x17,0x18,0x19, 0x16,0x17,0x18,0x19
+};
+static const u8 LEGACY_FUJI4_U0D_PMAP14[FUJI_PMAP_SPARSE_COUNT] = {
+    0x00,0x02,0x06, 0x01,0x03,0x07, 0x16,0x18,0x1a,0x1c, 0x17,0x19,0x1b,0x1d
+};
 
 static inline i64 sc6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
     register i64 x8 __asm__("x8") = n;
@@ -119,9 +124,6 @@ static int mem_is_zero(const u8 *a, u64 n) {
     for (u64 i = 0; i < n; i++) if (a[i] != 0U) return 0;
     return 1;
 }
-static void mem_cpy(u8 *dst, const u8 *src, u64 n) {
-    for (u64 i = 0; i < n; i++) dst[i] = src[i];
-}
 static int ends_with(const char *s, u64 n, const char *suf) {
     u64 m = slen(suf);
     if (n < m) return 0;
@@ -189,7 +191,7 @@ static void sha_buf(const u8 *p, u64 n, u8 dig[32]) {
 static char g_maps[131072];
 static u64  g_maps_len;
 static u8   g_iobuf[4096];
-static u8   g_zeros[CP_CHUNK]; /* BSS-allocated zeros for rollback / tail padding */
+static u8   g_zeros[CP_CHUNK];
 
 static u64 read_text_file(const char *path, char *buf, u64 cap) {
     i64 fd = sys_open(path, O_RDONLY, 0);
@@ -321,7 +323,30 @@ static int cp_dma_write_contig(u32 cp_va, const u8 *src, u32 len) {
     return (rb != 0) && mem_eq(rb, src, len);
 }
 
-/* Chunked helpers for multi-page spans (> CP_PAGE, e.g. 6,912 B gamma cave) */
+static int pmap14_eq(const u8 *span49, const u8 exp[FUJI_PMAP_SPARSE_COUNT]) {
+    for (u32 i = 0; i < FUJI_PMAP_SPARSE_COUNT; i++) {
+        if (span49[FUJI_PMAP_OFFS[i]] != exp[i]) return 0;
+    }
+    return 1;
+}
+
+__attribute__((noinline))
+static int cp_dma_write_pmap14(u32 base_va, const u8 src[FUJI_PMAP_SPARSE_COUNT]) {
+    u32 al_start = 0, dma_len = 0;
+    u8 *p = cp_dma_read_span(base_va, FUJI_PMAP_SPAN_LEN, &al_start, &dma_len);
+    if (!p) return 0;
+    for (u32 i = 0; i < FUJI_PMAP_SPARSE_COUNT; i++) p[FUJI_PMAP_OFFS[i]] = src[i];
+    mem_barrier_sy();
+    if (g_sen_dma(1U, g_cp_phys, (u64)al_start, dma_len) != 0U) return 0;
+    u8 *rb = cp_dma_read_span(base_va, FUJI_PMAP_SPAN_LEN, 0, 0);
+    return (rb != 0) && pmap14_eq(rb, src);
+}
+
+static int cp_dma_eq_pmap14(u32 base_va, const u8 exp[FUJI_PMAP_SPARSE_COUNT]) {
+    u8 *p = cp_dma_read_span(base_va, FUJI_PMAP_SPAN_LEN, 0, 0);
+    return (p != 0) && pmap14_eq(p, exp);
+}
+
 static int cp_dma_check_chunked(u32 cp_va, const u8 *exp_or_null_zero, u32 total_len) {
     u32 off = 0;
     while (off < total_len) {
@@ -351,32 +376,34 @@ static int cp_dma_write_chunked(u32 cp_va, const u8 *src_or_null_zero, u32 total
     return 1;
 }
 
-/* ---- Touched tracking + exact pre-apply state for clean rollback --------- */
-static u8 g_t_gamma;
-static u8 g_t_desc[FUJI_DESC_COUNT];
-static u8 g_t_u01_slots;
-static u8 g_t_u01_pmap;
-static u8 g_t_u0d_slot[FUJI_U0D_SLOT_COUNT];
-static u8 g_t_u0d_pmap;
-
-static u8 g_orig_desc[FUJI_DESC_COUNT][28];
-static u8 g_orig_u01_pmap[8];
-static u8 g_orig_u0d_pmap[8];
+/* Safe park-to-Stock & clean rollback helper */
+static int park_stock_and_rollback(int zero_caves) {
+    u32 fail = 0;
+    for (u32 i = 0; i < FUJI_MODE_COUNT; i++) {
+        if (!cp_dma_write_contig(FUJI_MODES[i].cp_va, FUJI_MODES[i].stock, 8U)) fail++;
+    }
+    for (u32 i = 0; i < FUJI_DESC_COUNT; i++) {
+        if (!cp_dma_write_contig(FUJI_DESCS[i].cp_va, FUJI_DESCS[i].stock, 28U)) fail++;
+    }
+    if (!cp_dma_write_pmap14(FUJI_U01_PMAP_BASE_VA, FUJI_PMAP14_STOCK)) fail++;
+    if (!cp_dma_write_pmap14(FUJI_U0D_PMAP_BASE_VA, FUJI_PMAP14_STOCK)) fail++;
+    for (u32 i = 0; i < FUJI_AUX_DESC_COUNT; i++) {
+        if (!cp_dma_write_contig(FUJI_AUX_DESCS[i].cp_va, g_zeros, 28U)) fail++;
+    }
+    if (zero_caves) {
+        if (!cp_dma_write_chunked(FUJI_U01_SLOTS_VA, 0, FUJI_U01_SCRUB_LEN)) fail++;
+        for (u32 sl = 0; sl < FUJI_U0D_SCRUB_SLOTS; sl++) {
+            if (!cp_dma_write_chunked(FUJI_U0D_SLOTS_VA + sl * FUJI_U0D_SLOT_STRIDE, 0, FUJI_U0D_SLOT_STRIDE)) fail++;
+        }
+        if (!cp_dma_write_chunked(FUJI_GAMMA_CAVE_VA, 0, FUJI_GAMMA_CAVE_LEN)) fail++;
+    }
+    return (fail == 0U);
+}
 
 static void rollback_all(void) {
     out_s("== ROLLBACK: restoring prior state to all touched CP Fuji sites\n");
-    u32 fail = 0;
-    if (g_t_u0d_pmap  && !cp_dma_write_contig(FUJI_U0D_PMAP_VA, g_orig_u0d_pmap, 8U)) fail++;
-    if (g_t_u01_pmap  && !cp_dma_write_contig(FUJI_U01_PMAP_VA, g_orig_u01_pmap, 8U)) fail++;
-    for (u32 s = 0; s < FUJI_U0D_SLOT_COUNT; s++) {
-        if (g_t_u0d_slot[s] && !cp_dma_write_contig(FUJI_U0D_SLOTS_VA + s * FUJI_U0D_SLOT_STRIDE, g_zeros, FUJI_U0D_SLOT_STRIDE)) fail++;
-    }
-    if (g_t_u01_slots && !cp_dma_write_contig(FUJI_U01_SLOTS_VA, g_zeros, FUJI_U01_SLOTS_LEN)) fail++;
-    for (u32 i = 0; i < FUJI_DESC_COUNT; i++) {
-        if (g_t_desc[i] && !cp_dma_write_contig(FUJI_DESCS[i].cp_va, g_orig_desc[i], 28U)) fail++;
-    }
-    if (g_t_gamma && !cp_dma_write_chunked(FUJI_GAMMA_CAVE_VA, 0, FUJI_GAMMA_CAVE_LEN)) fail++;
-    out_s("ROLLBACK_FAILURES="); out_u64(fail); out_s("\n");
+    int ok = park_stock_and_rollback(1);
+    out_s("ROLLBACK_FAILURES="); out_u64(ok ? 0U : 1U); out_s("\n");
 }
 
 __attribute__((visibility("default"))) void _init(void) {
@@ -462,85 +489,105 @@ __attribute__((visibility("default"))) void _init(void) {
     }
     out_s("PASS0_IDENTITY=OK\n");
 
-    /* ==== PASS 1: 100% Dry Preimage Check (All 13 CP Data Regions) ======== */
+    /* ==== PASS 1: Dry Preimage Check across all Fuji 8-Sim CP Data Regions == */
     u32 pre_errs = 0, to_apply = 0;
 
-    /* 1a. Gamma cave 0x0010BD80 (6,912 B: stock all zeros OR already Fuji target) */
+    /* 1a. Gamma cave 0x0010BD80 (13,824 B: stock zeros, legacy 4-sim + zeros, or already 8-sim target) */
     {
         int is_z = cp_dma_check_chunked(FUJI_GAMMA_CAVE_VA, 0, FUJI_GAMMA_CAVE_LEN);
         int is_t = (is_z == 1) ? 0 : cp_dma_check_chunked(FUJI_GAMMA_CAVE_VA, FUJI_GAMMA_CURVES, FUJI_GAMMA_CAVE_LEN);
-        if (is_z < 0 || is_t < 0) { out_s("PRE_FAIL gamma_cave_read\n"); pre_errs++; }
-        else if (is_z == 1) to_apply++;
+        int is_z_tail = (is_z == 1 || is_t == 1) ? 0 : cp_dma_check_chunked(FUJI_GAMMA_CAVE_VA + 6912U, 0, FUJI_GAMMA_CAVE_LEN - 6912U);
+        if (is_z < 0 || is_t < 0 || is_z_tail < 0) { out_s("PRE_FAIL gamma_cave_read\n"); pre_errs++; }
+        else if (is_z == 1 || is_z_tail == 1) to_apply++;
         else if (is_t != 1) { out_s("PRE_FAIL gamma_cave_mismatch\n"); pre_errs++; }
     }
 
-    /* 1b. 8 Gamma descriptors (desc[37..44]: FL/VV2/IN/SH Still + Movie) */
+    /* 1b. 8 Aux descriptors (must be all-zero OR already 8-sim target) */
+    for (u32 i = 0; i < FUJI_AUX_DESC_COUNT; i++) {
+        const struct fuji_aux_desc *d = &FUJI_AUX_DESCS[i];
+        u8 *p = cp_dma_read_span(d->cp_va, 28U, 0, 0);
+        if (!p) { out_s("PRE_FAIL aux_read "); out_s(d->name); out_s("\n"); pre_errs++; }
+        else if (mem_is_zero(p, 28U)) to_apply++;
+        else if (!mem_eq(p, d->target, 28U)) {
+            out_s("PRE_FAIL "); out_s(d->name); out_s(" got="); out_hex_bytes(p, 28U); out_s("\n");
+            pre_errs++;
+        }
+    }
+
+    /* 1c. 4 Mode-table entries @ 0x00DE08CC (stock OR already 8-sim target) */
+    for (u32 i = 0; i < FUJI_MODE_COUNT; i++) {
+        const struct fuji_mode_patch *m = &FUJI_MODES[i];
+        u8 *p = cp_dma_read_span(m->cp_va, 8U, 0, 0);
+        if (!p) { out_s("PRE_FAIL mode_read "); out_s(m->name); out_s("\n"); pre_errs++; }
+        else if (mem_eq(p, m->stock, 8U)) to_apply++;
+        else if (!mem_eq(p, m->target, 8U)) {
+            out_s("PRE_FAIL "); out_s(m->name); out_s(" got="); out_hex_bytes(p, 8U); out_s("\n");
+            pre_errs++;
+        }
+    }
+
+    /* 1d. 8 Direct descriptors desc[37..44] (stock, FX2 alt, legacy 4-sim in cave, or 8-sim target) */
     for (u32 i = 0; i < FUJI_DESC_COUNT; i++) {
         const struct fuji_desc_patch *d = &FUJI_DESCS[i];
         u8 *p = cp_dma_read_span(d->cp_va, 28U, 0, 0);
         if (!p) { out_s("PRE_FAIL desc_read "); out_s(d->name); out_s("\n"); pre_errs++; }
-        else {
-            mem_cpy(g_orig_desc[i], p, 28U);
-            if (mem_eq(p, d->stock, 28U) || mem_eq(p, d->alt_fl23, 28U)) to_apply++;
-            else if (!mem_eq(p, d->target, 28U)) {
-                out_s("PRE_FAIL "); out_s(d->name); out_s(" got="); out_hex_bytes(p, 28U); out_s("\n");
-                pre_errs++;
-            }
+        else if (mem_eq(p, d->target, 28U)) {
+            /* already 8-sim target */
+        } else if (mem_eq(p, d->stock, 28U) || mem_eq(p, d->alt_fl23, 28U) ||
+                   (p[2] == 0x10U && p[3] == 0x00U)) {
+            to_apply++;
+        } else {
+            out_s("PRE_FAIL "); out_s(d->name); out_s(" got="); out_hex_bytes(p, 28U); out_s("\n");
+            pre_errs++;
         }
     }
 
-    /* 1c. Chroma unit 0x02A40001: param map (8 B) & verified slots 22..25 (256 B) */
+    /* 1e. Sparse 14-byte Chroma & Matrix pmaps (checked separately: single DMA bounce buf!) */
+    int legacy4 = 0;
     {
-        u8 *pm = cp_dma_read_span(FUJI_U01_PMAP_VA, 8U, 0, 0);
-        if (!pm) { out_s("PRE_FAIL u01_pmap_read\n"); pre_errs++; }
-        else {
-            mem_cpy(g_orig_u01_pmap, pm, 8U);
-            if (mem_eq(pm, FUJI_PMAP_STOCK, 8U) || mem_eq(pm, FUJI_PMAP_FL23, 8U)) to_apply++;
-            else if (!mem_eq(pm, FUJI_U01_PMAP_NEW, 8U)) {
-                out_s("PRE_FAIL u01_pmap got="); out_hex_bytes(pm, 8U); out_s("\n");
-                pre_errs++;
-            }
-        }
+        u8 *m1 = cp_dma_read_span(FUJI_U01_PMAP_BASE_VA, FUJI_PMAP_SPAN_LEN, 0, 0);
+        if (!m1) { out_s("PRE_FAIL u01_pmap_read\n"); pre_errs++; }
+        else if (pmap14_eq(m1, FUJI_PMAP14_NEW)) { /* already 8-sim */ }
+        else if (pmap14_eq(m1, LEGACY_FUJI4_U01_PMAP14)) { legacy4 = 1; to_apply++; }
+        else if (pmap14_eq(m1, FUJI_PMAP14_STOCK) || pmap14_eq(m1, FUJI_PMAP14_FL23)) { to_apply++; }
+        else { out_s("PRE_FAIL u01_pmap\n"); pre_errs++; }
 
+        u8 *m2 = cp_dma_read_span(FUJI_U0D_PMAP_BASE_VA, FUJI_PMAP_SPAN_LEN, 0, 0);
+        if (!m2) { out_s("PRE_FAIL u0d_pmap_read\n"); pre_errs++; }
+        else if (pmap14_eq(m2, FUJI_PMAP14_NEW)) { /* already 8-sim */ }
+        else if (pmap14_eq(m2, LEGACY_FUJI4_U0D_PMAP14)) { legacy4 = 1; to_apply++; }
+        else if (pmap14_eq(m2, FUJI_PMAP14_STOCK) || pmap14_eq(m2, FUJI_PMAP14_FL23)) { to_apply++; }
+        else { out_s("PRE_FAIL u0d_pmap\n"); pre_errs++; }
+    }
+
+    /* 1f. Chroma slots 22..28 & Matrix slots 22..28 */
+    {
         u8 *sl = cp_dma_read_span(FUJI_U01_SLOTS_VA, FUJI_U01_SLOTS_LEN, 0, 0);
         if (!sl) { out_s("PRE_FAIL u01_slots_read\n"); pre_errs++; }
-        else if (mem_eq(sl, FUJI_U01_SLOTS_NEW, FUJI_U01_SLOTS_LEN)) {
-            /* already applied */
-        } else if (mem_is_zero(sl, FUJI_U01_SLOTS_LEN) || mem_eq(sl, FL23_U01_SLOTS_NEW, FUJI_U01_SLOTS_LEN)) {
+        else if (mem_eq(sl, FUJI_U01_SLOTS_NEW, FUJI_U01_SLOTS_LEN)) { /* already 8-sim */ }
+        else if (mem_is_zero(sl, FUJI_U01_SLOTS_LEN) ||
+                 (mem_eq(sl, FL23_U01_SLOTS_NEW, FL23_U01_SLOTS_LEN) && mem_is_zero(sl + 256U, FUJI_U01_SLOTS_LEN - 256U)) ||
+                 (legacy4 && mem_is_zero(sl + 256U, FUJI_U01_SLOTS_LEN - 256U))) {
             to_apply++;
         } else {
             out_s("PRE_FAIL u01_slots head="); out_hex_bytes(sl, 16); out_s("\n");
             pre_errs++;
         }
-    }
-
-    /* 1d. Matrix unit 0x02A4000D: param map (8 B) & slots 22..29 (8 x 768 B) */
-    {
-        u8 *pm = cp_dma_read_span(FUJI_U0D_PMAP_VA, 8U, 0, 0);
-        if (!pm) { out_s("PRE_FAIL u0d_pmap_read\n"); pre_errs++; }
-        else {
-            mem_cpy(g_orig_u0d_pmap, pm, 8U);
-            if (mem_eq(pm, FUJI_PMAP_STOCK, 8U) || mem_eq(pm, FUJI_PMAP_FL23, 8U)) to_apply++;
-            else if (!mem_eq(pm, FUJI_U0D_PMAP_NEW, 8U)) {
-                out_s("PRE_FAIL u0d_pmap got="); out_hex_bytes(pm, 8U); out_s("\n");
-                pre_errs++;
-            }
-        }
 
         u32 slot_need = 0;
         for (u32 s = 0; s < FUJI_U0D_SLOT_COUNT; s++) {
             u32 sva = FUJI_U0D_SLOTS_VA + s * FUJI_U0D_SLOT_STRIDE;
-            u8 *sl = cp_dma_read_span(sva, FUJI_U0D_SLOT_STRIDE, 0, 0);
-            if (!sl) { out_s("PRE_FAIL u0d_slot_read\n"); pre_errs++; break; }
-            int is_fuji = mem_eq(sl, FUJI_U0D_ACTIVE_NEW + s * FUJI_U0D_ACTIVE_LEN, FUJI_U0D_ACTIVE_LEN) &&
-                          mem_is_zero(sl + FUJI_U0D_ACTIVE_LEN, FUJI_U0D_SLOT_STRIDE - FUJI_U0D_ACTIVE_LEN);
-            int is_zero = mem_is_zero(sl, FUJI_U0D_SLOT_STRIDE);
-            int is_fl23 = (s < 4U) && mem_eq(sl, FL23_U0D_SLOTS_NEW + s * FUJI_U0D_SLOT_STRIDE, FUJI_U0D_SLOT_STRIDE);
+            u8 *ps = cp_dma_read_span(sva, FUJI_U0D_SLOT_STRIDE, 0, 0);
+            if (!ps) { out_s("PRE_FAIL u0d_slot_read\n"); pre_errs++; break; }
+            int is_fuji = mem_eq(ps, FUJI_U0D_ACTIVE_NEW + s * FUJI_U0D_ACTIVE_LEN, FUJI_U0D_ACTIVE_LEN) &&
+                          mem_is_zero(ps + FUJI_U0D_ACTIVE_LEN, FUJI_U0D_SLOT_STRIDE - FUJI_U0D_ACTIVE_LEN);
+            int is_zero = mem_is_zero(ps, FUJI_U0D_SLOT_STRIDE);
+            int is_fl23 = (s < 4U) && mem_eq(ps, FL23_U0D_SLOTS_NEW + s * FUJI_U0D_SLOT_STRIDE, FUJI_U0D_SLOT_STRIDE);
+            int is_leg4 = legacy4 && mem_is_zero(ps + FUJI_U0D_ACTIVE_LEN, FUJI_U0D_SLOT_STRIDE - FUJI_U0D_ACTIVE_LEN);
             if (is_fuji) continue;
-            if (is_zero || is_fl23) {
-                slot_need = 1;
-            } else {
-                out_s("PRE_FAIL u0d_slot="); out_u64(22u + s); out_s(" head="); out_hex_bytes(sl, 12); out_s("\n");
+            if (is_zero || is_fl23 || is_leg4) slot_need = 1;
+            else {
+                out_s("PRE_FAIL u0d_slot="); out_u64(22u + s); out_s(" head="); out_hex_bytes(ps, 12); out_s("\n");
                 pre_errs++;
                 break;
             }
@@ -553,65 +600,49 @@ __attribute__((visibility("default"))) void _init(void) {
         goto cleanup;
     }
     if (to_apply == 0U) {
-        out_s("RESULT=NOTHING_TO_DO regions=13 writes=0\n");
+        out_s("RESULT=NOTHING_TO_DO regions=25 writes=0\n");
         goto cleanup;
     }
     out_s("PASS1_PREIMAGE=OK regions_to_write="); out_u64(to_apply); out_s("\n");
 
-    /* ==== PASS 2: Safe Ordering Apply (Data Caves FIRST -> Pointers/Maps LAST) === */
-    g_t_gamma = 0; g_t_u01_slots = 0; g_t_u01_pmap = 0; g_t_u0d_pmap = 0;
-    for (u32 i = 0; i < FUJI_DESC_COUNT; i++) g_t_desc[i] = 0;
-    for (u32 s = 0; s < FUJI_U0D_SLOT_COUNT; s++) g_t_u0d_slot[s] = 0;
-    int apply_err = 0;
-
-    /* 2a. Write payload tables first (gamma curves, chroma slots 26..33, matrix slots 26..33) */
-    if (!apply_err && cp_dma_check_chunked(FUJI_GAMMA_CAVE_VA, FUJI_GAMMA_CURVES, FUJI_GAMMA_CAVE_LEN) != 1) {
-        g_t_gamma = 1;
-        if (!cp_dma_write_chunked(FUJI_GAMMA_CAVE_VA, FUJI_GAMMA_CURVES, FUJI_GAMMA_CAVE_LEN)) apply_err = 1;
+    /* ==== PASS 2: Safe Ordering Apply (Park Stock -> Data Caves -> Pointers LAST) === */
+    if (!park_stock_and_rollback(0)) {
+        rollback_all();
+        out_s("RESULT=ABORT_ROLLED_BACK\n");
+        goto cleanup;
     }
-    if (!apply_err) {
-        u8 *p = cp_dma_read_span(FUJI_U01_SLOTS_VA, FUJI_U01_SLOTS_LEN, 0, 0);
-        if (!p || !mem_eq(p, FUJI_U01_SLOTS_NEW, FUJI_U01_SLOTS_LEN)) {
-            g_t_u01_slots = 1;
-            if (!cp_dma_write_contig(FUJI_U01_SLOTS_VA, FUJI_U01_SLOTS_NEW, FUJI_U01_SLOTS_LEN)) apply_err = 1;
-        }
+
+    int apply_err = 0;
+    if (!cp_dma_write_chunked(FUJI_GAMMA_CAVE_VA, FUJI_GAMMA_CURVES, FUJI_GAMMA_CAVE_LEN)) apply_err = 1;
+    for (u32 i = 0; i < FUJI_AUX_DESC_COUNT && !apply_err; i++) {
+        if (!cp_dma_write_contig(FUJI_AUX_DESCS[i].cp_va, FUJI_AUX_DESCS[i].target, 28U)) apply_err = 1;
+    }
+    if (!apply_err && (!cp_dma_write_contig(FUJI_U01_SLOTS_VA, FUJI_U01_SLOTS_NEW, FUJI_U01_SLOTS_LEN) ||
+                       !cp_dma_write_contig(FUJI_U01_SLOTS_VA + FUJI_U01_SLOTS_LEN, g_zeros, FUJI_U01_SCRUB_LEN - FUJI_U01_SLOTS_LEN))) {
+        apply_err = 1;
     }
     for (u32 s = 0; s < FUJI_U0D_SLOT_COUNT && !apply_err; s++) {
         u32 sva = FUJI_U0D_SLOTS_VA + s * FUJI_U0D_SLOT_STRIDE;
         const u8 *act = FUJI_U0D_ACTIVE_NEW + s * FUJI_U0D_ACTIVE_LEN;
-        u8 *p = cp_dma_read_span(sva, FUJI_U0D_SLOT_STRIDE, 0, 0);
-        if (p && mem_eq(p, act, FUJI_U0D_ACTIVE_LEN) &&
-            mem_is_zero(p + FUJI_U0D_ACTIVE_LEN, FUJI_U0D_SLOT_STRIDE - FUJI_U0D_ACTIVE_LEN)) {
-            continue;
-        }
-        g_t_u0d_slot[s] = 1;
         if (!cp_dma_write_contig(sva, act, FUJI_U0D_ACTIVE_LEN) ||
             !cp_dma_write_contig(sva + FUJI_U0D_ACTIVE_LEN, g_zeros, FUJI_U0D_SLOT_STRIDE - FUJI_U0D_ACTIVE_LEN)) {
             apply_err = 1;
         }
     }
+    for (u32 s = FUJI_U0D_SLOT_COUNT; s < FUJI_U0D_SCRUB_SLOTS && !apply_err; s++) {
+        if (!cp_dma_write_chunked(FUJI_U0D_SLOTS_VA + s * FUJI_U0D_SLOT_STRIDE, 0, FUJI_U0D_SLOT_STRIDE)) apply_err = 1;
+    }
 
-    /* 2b. Flip pointers & param-maps last (all backing data is already in CP RAM!) */
+    /* Flip direct descriptors, mode-table redirects, & sparse pmaps LAST */
     for (u32 i = 0; i < FUJI_DESC_COUNT && !apply_err; i++) {
-        const struct fuji_desc_patch *d = &FUJI_DESCS[i];
-        u8 *p = cp_dma_read_span(d->cp_va, 28U, 0, 0);
-        if (p && mem_eq(p, d->target, 28U)) continue;
-        g_t_desc[i] = 1;
-        if (!cp_dma_write_contig(d->cp_va, d->target, 28U)) apply_err = 1;
+        if (!cp_dma_write_contig(FUJI_DESCS[i].cp_va, FUJI_DESCS[i].target, 28U)) apply_err = 1;
     }
-    if (!apply_err) {
-        u8 *p = cp_dma_read_span(FUJI_U01_PMAP_VA, 8U, 0, 0);
-        if (!p || !mem_eq(p, FUJI_U01_PMAP_NEW, 8U)) {
-            g_t_u01_pmap = 1;
-            if (!cp_dma_write_contig(FUJI_U01_PMAP_VA, FUJI_U01_PMAP_NEW, 8U)) apply_err = 1;
-        }
+    for (u32 i = 0; i < FUJI_MODE_COUNT && !apply_err; i++) {
+        if (!cp_dma_write_contig(FUJI_MODES[i].cp_va, FUJI_MODES[i].target, 8U)) apply_err = 1;
     }
-    if (!apply_err) {
-        u8 *p = cp_dma_read_span(FUJI_U0D_PMAP_VA, 8U, 0, 0);
-        if (!p || !mem_eq(p, FUJI_U0D_PMAP_NEW, 8U)) {
-            g_t_u0d_pmap = 1;
-            if (!cp_dma_write_contig(FUJI_U0D_PMAP_VA, FUJI_U0D_PMAP_NEW, 8U)) apply_err = 1;
-        }
+    if (!apply_err && (!cp_dma_write_pmap14(FUJI_U01_PMAP_BASE_VA, FUJI_PMAP14_NEW) ||
+                       !cp_dma_write_pmap14(FUJI_U0D_PMAP_BASE_VA, FUJI_PMAP14_NEW))) {
+        apply_err = 1;
     }
 
     if (apply_err) {
@@ -623,17 +654,23 @@ __attribute__((visibility("default"))) void _init(void) {
     /* ==== PASS 3: End-to-End Readback Verification ======================== */
     u32 rb_errs = 0;
     if (cp_dma_check_chunked(FUJI_GAMMA_CAVE_VA, FUJI_GAMMA_CURVES, FUJI_GAMMA_CAVE_LEN) != 1) rb_errs++;
+    for (u32 i = 0; i < FUJI_AUX_DESC_COUNT; i++) {
+        u8 *p = cp_dma_read_span(FUJI_AUX_DESCS[i].cp_va, 28U, 0, 0);
+        if (!p || !mem_eq(p, FUJI_AUX_DESCS[i].target, 28U)) rb_errs++;
+    }
     for (u32 i = 0; i < FUJI_DESC_COUNT; i++) {
         u8 *p = cp_dma_read_span(FUJI_DESCS[i].cp_va, 28U, 0, 0);
         if (!p || !mem_eq(p, FUJI_DESCS[i].target, 28U)) rb_errs++;
     }
+    for (u32 i = 0; i < FUJI_MODE_COUNT; i++) {
+        u8 *p = cp_dma_read_span(FUJI_MODES[i].cp_va, 8U, 0, 0);
+        if (!p || !mem_eq(p, FUJI_MODES[i].target, 8U)) rb_errs++;
+    }
     {
         u8 *p1 = cp_dma_read_span(FUJI_U01_SLOTS_VA, FUJI_U01_SLOTS_LEN, 0, 0);
         if (!p1 || !mem_eq(p1, FUJI_U01_SLOTS_NEW, FUJI_U01_SLOTS_LEN)) rb_errs++;
-        u8 *m1 = cp_dma_read_span(FUJI_U01_PMAP_VA, 8U, 0, 0);
-        if (!m1 || !mem_eq(m1, FUJI_U01_PMAP_NEW, 8U)) rb_errs++;
-        u8 *m2 = cp_dma_read_span(FUJI_U0D_PMAP_VA, 8U, 0, 0);
-        if (!m2 || !mem_eq(m2, FUJI_U0D_PMAP_NEW, 8U)) rb_errs++;
+        if (!cp_dma_eq_pmap14(FUJI_U01_PMAP_BASE_VA, FUJI_PMAP14_NEW)) rb_errs++;
+        if (!cp_dma_eq_pmap14(FUJI_U0D_PMAP_BASE_VA, FUJI_PMAP14_NEW)) rb_errs++;
         for (u32 s = 0; s < FUJI_U0D_SLOT_COUNT; s++) {
             u32 sva = FUJI_U0D_SLOTS_VA + s * FUJI_U0D_SLOT_STRIDE;
             u8 *ps = cp_dma_read_span(sva, FUJI_U0D_SLOT_STRIDE, 0, 0);
@@ -651,8 +688,8 @@ __attribute__((visibility("default"))) void _init(void) {
         goto cleanup;
     }
 
-    out_s("PASS3_READBACK=OK regions=13\n");
-    out_s("RESULT=APPLY_OK mode=cp_data_only FL=ClassicChrome VV2=ClassicNeg IN=NostalgicNeg SH=Eterna2383\n");
+    out_s("PASS3_READBACK=OK regions=25\n");
+    out_s("RESULT=APPLY_OK mode=cp_data_only ST=Provia PT=Astia VV=Velvia VV2=ClassicNeg FL=ClassicChrome IN=ProNegHi SH=Eterna BW=Acros\n");
 
 cleanup:
     sys_munmap((void *)cp_map, cp_maplen);

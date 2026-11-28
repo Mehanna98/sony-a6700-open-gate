@@ -1,59 +1,82 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# One-time macOS setup for Sony ILCE-6700 (FW v2.00) v6.1 100% RAM-Only Launcher
-# Works on Apple Silicon (M1/M2/M3/M4) and Intel Macs. Zero camera contact.
+# One-time macOS setup for Project Wildcard a6700 (FW v2.00) -- 100% Zero-Flash RAM-Only
+# Works on Apple Silicon (M1/M2/M3/M4) and Intel Macs.
+# Bundles libusb via libusb-package (no Homebrew needed). Zero camera contact during setup.
 
-cd "$(dirname "$0")"
+export PATH="/opt/homebrew/bin:/usr/local/bin:/Library/Frameworks/Python.framework/Versions/Current/bin:$PATH"
+cd "$(dirname "$0")" || exit 1
+
+NO_PAUSE=0
+if [ "${1:-}" = "--no-pause" ]; then
+  NO_PAUSE=1
+fi
+
+finish() {
+  local rc="$1"
+  if [ "$NO_PAUSE" -eq 0 ]; then
+    echo ""
+    read -r -p "Press Return to close..."
+  fi
+  exit "$rc"
+}
 
 echo "============================================================"
-echo "  Sony a6700 (FW v2.00) -- v6.1 macOS One-Time Setup"
+echo "  Project Wildcard a6700 (FW v2.00) -- macOS One-Time Setup"
 echo "  Zero flash writes. Zero camera contact during setup."
 echo "============================================================"
 echo ""
 
-# Ensure Homebrew libusb is installed
-if command -v brew >/dev/null 2>&1; then
-  if ! brew list libusb >/dev/null 2>&1; then
-    echo "[1/3] Installing libusb via Homebrew..."
-    brew install libusb
-  else
-    echo "[1/3] libusb already installed via Homebrew."
-  fi
-else
-  echo "[WARN] Homebrew not found. Install Homebrew from https://brew.sh and run:"
-  echo "       brew install libusb"
-  echo ""
-fi
-
-# Pick python3
+# Find a real Python 3.9+ with venv support (avoids Apple's uninitialized /usr/bin/python3 stub)
 PY_BIN=""
-for cand in /opt/homebrew/bin/python3 /usr/local/bin/python3 "$(command -v python3 || true)"; do
+for cand in \
+  /opt/homebrew/bin/python3 \
+  /Library/Frameworks/Python.framework/Versions/Current/bin/python3 \
+  /usr/local/bin/python3 \
+  "$(command -v python3 || true)"; do
   if [ -n "$cand" ] && [ -x "$cand" ]; then
-    PY_BIN="$cand"
-    break
+    if "$cand" -c 'import sys, venv; sys.exit(sys.version_info < (3, 9))' 2>/dev/null; then
+      PY_BIN="$cand"
+      break
+    fi
   fi
 done
 
 if [ -z "$PY_BIN" ]; then
-  echo "[ERROR] python3 not found. Install it with: brew install python"
-  read -r -p "Press Enter to exit..."
-  exit 1
+  echo "[ERROR] Python 3.9 or later not found."
+  echo "        Install Python from https://www.python.org/downloads/macos/"
+  echo "        OR install Xcode Command Line Tools: xcode-select --install"
+  echo "        Then double-click Project_Wildcard_a6700.command again."
+  finish 1
 fi
 
-echo "[2/3] Creating local Python environment (.venv_mac) with $PY_BIN..."
-"$PY_BIN" -m venv .venv_mac
-.venv_mac/bin/python -m pip install --upgrade pip >/dev/null
-.venv_mac/bin/python -m pip install -r ../windows/requirements.txt
+echo "[1/3] Creating local Python environment (.venv_mac) with: $PY_BIN"
+"$PY_BIN" -m venv .venv_mac || finish 1
+
+echo "[2/3] Installing USB & crypto packages (pyusb, pycryptodomex, libusb-package)..."
+.venv_mac/bin/python -m pip install --upgrade pip >/dev/null || true
+if ! .venv_mac/bin/python -m pip install -r requirements.txt; then
+  echo ""
+  echo "[WARN] libusb-package wheel install failed on this Python version; trying core packages + Homebrew libusb..."
+  .venv_mac/bin/python -m pip install -r ../windows/requirements.txt || finish 1
+  if [ ! -f /opt/homebrew/lib/libusb-1.0.dylib ] && [ ! -f /usr/local/lib/libusb-1.0.dylib ]; then
+    if command -v brew >/dev/null 2>&1; then
+      brew install libusb || finish 1
+    else
+      echo "[ERROR] No libusb library found. Install Python 3.12 from python.org or run: brew install libusb"
+      finish 1
+    fi
+  fi
+fi
 
 echo ""
 echo "[3/3] Running offline payload & SHA-256 verification (0 USB calls)..."
-export DYLD_LIBRARY_PATH="/opt/homebrew/lib:/usr/local/lib:${DYLD_LIBRARY_PATH:-}"
-.venv_mac/bin/python -I -B ../runner/a6700_ram_runner.py --dry-run
+.venv_mac/bin/python -I -B ../runner/a6700_ram_runner.py --dry-run || finish 1
 
 echo ""
 echo "============================================================"
-echo "  macOS SETUP COMPLETE!"
-echo "  Next: run ./a6700_launcher_mac.command"
+echo "  macOS SETUP COMPLETE! (No USB driver install needed.)"
+echo "  Next: double-click Project_Wildcard_a6700.command"
 echo "============================================================"
-read -r -p "Press Enter to close..."
+finish 0

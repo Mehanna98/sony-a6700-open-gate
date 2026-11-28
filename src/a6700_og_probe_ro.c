@@ -374,8 +374,8 @@ static void scan_cp_for_dmmcfg(void) {
     u32 hit_va = 0;
 
     static const u8 DMM_SIG_8A_OG[40] = {
-        0x7f,0x05,0x00,0x00, 0x00,0xfc,0x6c,0x01, 0x0f,0x01,0x00,0x00, 0x00,0x00,0x00,0x00, 0x07,0x00,0x00,0x00,
-        0x7f,0x05,0x00,0x00, 0x00,0xfc,0x6c,0x01, 0x0f,0x01,0x00,0x00, 0x00,0x00,0x00,0x00, 0x07,0x00,0x00,0x00
+        0x7f,0x05,0x00,0x00, 0x00,0x5a,0x6d,0x01, 0x0f,0x01,0x00,0x00, 0x00,0x00,0x00,0x00, 0x07,0x00,0x00,0x00,
+        0x7f,0x05,0x00,0x00, 0x00,0x5a,0x6d,0x01, 0x0f,0x01,0x00,0x00, 0x00,0x00,0x00,0x00, 0x07,0x00,0x00,0x00
     };
     out_s("== cp dmmcfg 0x57f locator (read-only)\n");
     for (u32 r = 0; r < 3u && !hit_va && g_cp_ok; r++) {
@@ -434,7 +434,7 @@ static void scan_cp_for_dmmcfg(void) {
               rd_u32(b8b) == 0x124U && rd_u32(b8b + 4U) == 0x03B00000U &&
               rd_u32(b8c) == 0x0ECU && rd_u32(b8c + 4U) == 0x01D80000U &&
               rd_u32(b8d) == 0x0EBU && rd_u32(b8d + 4U) == 0x00EC0000U &&
-              rd_u32(b8e) == 0x57fU && (sz_8e == 0x01341200U || sz_8e == 0x016CFC00U || sz_8e == 0x017A3400U || sz_8e == 0x017BAC00U) &&
+              rd_u32(b8e) == 0x57fU && (sz_8e == 0x01341200U || sz_8e == 0x016D5A00U || sz_8e == 0x016CFC00U || sz_8e == 0x017A3400U || sz_8e == 0x017BAC00U) &&
               rd_u32(b8e + 20U) == 0x634U && rd_u32(b8e + 24U) == 0x0032A000U &&
               rd_u32(b8e + 60U) == 0x635U && rd_u32(b8e + 64U) == 0x00CA8000U &&
               rd_u32(b8e + 100U) == 0x2DAU && rd_u32(b8e + 104U) == 0x013C6800U &&
@@ -724,8 +724,8 @@ static void probe_coprocessor(int sencore_ready) {
         if (!ok) g_mismatches++;
     }
 
-    /* 2. Verify all 30 small sensor/table cells (8 IMX684 S0 + 11 NTSC 0x08c0 + 11 PAL 0x0880) */
-    out_s("== cp ogsq cells (30)\n");
+    /* 2. Verify all 51 Col-1 sensor/table cells (6 IMX684 regs + 9x5 modes 0x820/0x880/0x890/0x8c0/0x8d0) */
+    out_s("== cp ogsq cells (51)\n");
     for (u32 i = 0; i < OG_CP_CELL_COUNT && g_cp_ok; i++) {
         const struct og_cp_cell *c = &OG_CP_CELLS[i];
         u8 got[4];
@@ -811,12 +811,13 @@ static void probe_coprocessor(int sencore_ready) {
         out_s("!! OBS_DRVPARAM_880 READ_ERR\n");
     }
     {
-        static const struct { const char *tag; u32 va; } alt_drvs[3] = {
+        static const struct { const char *tag; u32 va; } alt_drvs[4] = {
             { "OBS_DRVPARAM_820", CP_DRVPARAM_820 },
+            { "OBS_DRVPARAM_830", CP_DRVPARAM_830 },
             { "OBS_DRVPARAM_890", CP_DRVPARAM_890 },
             { "OBS_DRVPARAM_8D0", CP_DRVPARAM_8D0 },
         };
-        for (u32 k = 0; k < 3u && g_cp_ok; k++) {
+        for (u32 k = 0; k < 4u && g_cp_ok; k++) {
             u8 hdr[48];
             if (cp_read_bytes(alt_drvs[k].va, hdr, 48U)) {
                 out_s(alt_drvs[k].tag); out_s(" va="); out_hex(alt_drvs[k].va);
@@ -871,8 +872,8 @@ static void probe_coprocessor(int sencore_ready) {
 }
 
 static void probe_main_processor(void) {
-    /* 1. Step 3 libmpr.so g_videoParamComb (4 L1-comb sites in process memory) */
-    out_s("== mp libmpr.so sites (4)\n");
+    /* 1. Step 3 libmpr.so (8 verified M19 sites: 5 comb + 2 MP4 track heights + CompareResolution) */
+    out_s("== mp libmpr.so sites (8)\n");
     for (u32 i = 0; i < OG_LIBMPR_SITE_COUNT; i++) {
         const struct og_mp_site *s = &OG_LIBMPR_SITES[i];
         u64 va = find_mapped_slice("/libmpr.so", s->file_off, s->len, 1u /* r */, 0, 0);

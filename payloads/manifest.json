@@ -47,26 +47,62 @@
     {
       "name": "a6700_fuji_ram",
       "file": "a6700_fuji_ram.so",
-      "size": 34016,
-      "sha256": "0031fd96d6666e3c325d3956bfc69c059b8e888cb708e805e0e6da7a08778a61"
+      "size": 44088,
+      "sha256": "990debec157e8f6a7396b792e1a86ac7698d297a58de64df11226bf01d5d002b"
     },
     {
       "name": "a6700_cc_restore_stock",
       "file": "a6700_cc_restore_stock.so",
-      "size": 13232,
-      "sha256": "a15553d233a1723b22adeef6b61cb7607ff7e19fd524cd476062283148c7e7e5"
+      "size": 15384,
+      "sha256": "78ca388d72e799a742bffabf7c5dea7e48cb01f136cb2753407b2dda5a3bbacf"
     },
     {
       "name": "a6700_og_probe_ro",
       "file": "a6700_og_probe_ro.so",
-      "size": 29928,
-      "sha256": "6177fa4fcc14177741c6ee46a73ae1ca0afc1d0477ebfca3a32311f7740d6211"
+      "size": 31136,
+      "sha256": "df725edf6e32feddc1032b639ad27681e9ed22b865ccb27631430daf06187a7e"
+    },
+    {
+      "name": "a6700_pb_log_ro",
+      "file": "a6700_pb_log_ro.so",
+      "size": 11336,
+      "sha256": "f9430cd4d0049120be5f43274ff59f6453292890623d520b15f766e8d51dd49b"
     },
     {
       "name": "a6700_og_ram",
       "file": "a6700_og_ram.so",
-      "size": 42184,
-      "sha256": "8014b06ac0ad26aa569925b2afcea65f99d68bb2f9b0047ced316d14779cd671"
+      "size": 49192,
+      "sha256": "66eade6a639194c121819d08e52f47ea5cee06c77cb43e26161d5a7920993ca4"
+    },
+    {
+      "name": "a6700_og_off_ram",
+      "file": "a6700_og_off_ram.so",
+      "size": 46184,
+      "sha256": "a08fdb3a5eeb65467d51280f8778fd16d9b4f1969a6a0499dff2dd380cef0256"
+    },
+    {
+      "name": "a6700_looks_pack_ram",
+      "file": "a6700_looks_pack_ram.so",
+      "size": 42488,
+      "sha256": "62ca981b8a70190c7184464ee4c441b0568c4155bcff8ceb843acd88f4373af4"
+    },
+    {
+      "name": "a6700_og_menu_ram",
+      "file": "a6700_og_menu_ram.so",
+      "size": 60640,
+      "sha256": "98c0bb523019190f11987cd2a054417e4837bbf7b3602916fd89da08ab106c1f"
+    },
+    {
+      "name": "a6700_sd_bypass_ram",
+      "file": "a6700_sd_bypass_ram.so",
+      "size": 6992,
+      "sha256": "4c17dce86ad77a27fdc5c46c353869d89a06ac991fc82885032c0cfff08ad294"
+    },
+    {
+      "name": "a6700_sd_bypass_off_ram",
+      "file": "a6700_sd_bypass_off_ram.so",
+      "size": 7016,
+      "sha256": "729d774d2056116b3186ae4c52f0667cc47a82f923bbcb9890d07eb608590bc1"
     }
   ]
 }
